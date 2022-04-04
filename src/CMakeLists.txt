@@ -1,5 +1,6 @@
 find_package (Python3 COMPONENTS Interpreter Development)
 find_package(Torch REQUIRED)
+find_package(TBB CONFIG) #torch needs it
 
 set(FRNN_CXX_FLAGS "${TORCH_CXX_FLAGS}")
 
@@ -51,5 +52,9 @@ target_compile_options(frnn
             "$<BUILD_INTERFACE:$<$<COMPILE_LANGUAGE:CUDA>:${FRNN_CUDA_FLAGS}>>"
 )
 
+install(TARGETS frnn 
+    DESTINATION lib
+    EXPORT frnnTargets)
+
 file(GLOB HeaderFiles include/frnn/*.h)
-install(FILES ${})
+install(FILES ${HeaderFiles} DESTINATION include/frnn)

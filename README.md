@@ -13,6 +13,4 @@ It depends on `PyTorch` and `CUDA`.
 ```bash
 mkdir build && cd build && cmake .. -DCMAKE_PREFIX_PATH=$(python -c 'import torch;print(torch.utils.cmake_prefix_path)')
 ```
-<!-- In the directory `/home/atlas/python3.9` is the `kineto`,
-which is a library `Pytorch` needs. -->
 

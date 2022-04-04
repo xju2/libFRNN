@@ -1,4 +1,4 @@
-#include "insert_points.h"
+#include "frnn/insert_points.h"
 
 __global__ void InsertPoints2DKernel(const float *__restrict__ points,
                                      const long *__restrict__ lengths,

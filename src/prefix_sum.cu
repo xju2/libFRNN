@@ -34,7 +34,7 @@
 #include "device_launch_parameters.h"
 #include "device_functions.h"
 
-#include "prefix_sum.h"
+#include "frnn/prefix_sum.h"
 
 // scan.cuh
 void sequential_scan(int* output, int* input, int length);

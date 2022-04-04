@@ -1,4 +1,4 @@
-#include "counting_sort.h"
+#include "frnn/counting_sort.h"
 
 __global__ void CountingSort2DKernel(
     const float *__restrict__ points,   // (N, P, 2)

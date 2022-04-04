@@ -51,5 +51,5 @@ target_compile_options(frnn
             "$<BUILD_INTERFACE:$<$<COMPILE_LANGUAGE:CUDA>:${FRNN_CUDA_FLAGS}>>"
 )
 
-file(GLOB HeaderFiles include/*.h)
+file(GLOB HeaderFiles include/frnn/*.h)
 install(FILES ${})

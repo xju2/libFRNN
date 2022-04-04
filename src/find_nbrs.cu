@@ -1,4 +1,4 @@
-#include "find_nbrs.h"
+#include "frnn/find_nbrs.h"
 
 __global__ void FindNbrs2DKernelV1(
     const float *__restrict__ points1, const float *__restrict__ points2,

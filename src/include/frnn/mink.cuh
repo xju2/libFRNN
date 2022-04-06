@@ -3,7 +3,7 @@
 #pragma once
 #define MINK_H
 
-#include "index_utils.cuh"
+#include "frnn/index_utils.cuh"
 
 // A data structure to keep track of the smallest K keys seen so far as well
 // as their associated values, intended to be used in device code.

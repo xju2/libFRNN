@@ -56,5 +56,5 @@ install(TARGETS frnn
     DESTINATION lib
     EXPORT frnnTargets)
 
-file(GLOB HeaderFiles include/frnn/*.h)
+file(GLOB HeaderFiles include/frnn/*h)
 install(FILES ${HeaderFiles} DESTINATION include/frnn)

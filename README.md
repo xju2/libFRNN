@@ -7,10 +7,10 @@ and https://github.com/lxxue/prefix_sum
 
 
 ## Dependencies
-It depends on `PyTorch` and `CUDA`.
+It depends on `PyTorch` and `CUDA`, and `TBB` (needed for Pytorch).
 ## To build
 
 ```bash
-mkdir build && cd build && cmake .. -DCMAKE_PREFIX_PATH=$(python -c 'import torch;print(torch.utils.cmake_prefix_path)')
+cmake .. -DCMAKE_PREFIX_PATH=$(python -c 'import torch;print(torch.utils.cmake_prefix_path)')
 ```
 

@@ -1,10 +1,10 @@
 #include <tuple>
 
-#include "frnn/counting_sort.h"
-#include "frnn/grid.h"
-#include "frnn/mink.cuh"
+#include "counting_sort.h"
+#include "grid.h"
+#include "mink.cuh"
 // customized dispatch utils for our function type
-#include "frnn/dispatch.h"
+#include "dispatch.h"
 
 // TODO: add docs
 std::tuple<at::Tensor, at::Tensor> FindNbrsCUDA(

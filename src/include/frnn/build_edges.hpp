@@ -12,7 +12,7 @@
 #include <torch/torch.h>
 using namespace torch::indexing;
 
-namespace ExaTrkX {
+namespace frnn {
 void buildEdges(
     std::vector<float>& embedFeatures,
     std::vector<int64_t>& edgeList,

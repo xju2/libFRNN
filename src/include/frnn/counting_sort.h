@@ -3,8 +3,8 @@
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
 
-#include "frnn/grid.h"
-#include "frnn/dispatch.h"
+#include "grid.h"
+#include "dispatch.h"
 
 void CountingSortCUDA(const at::Tensor points, const at::Tensor lengths,
                       const at::Tensor grid_cell, const at::Tensor grid_idx,

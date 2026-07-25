@@ -3,6 +3,7 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
@@ -17,6 +18,16 @@
 #include <stdexcept>
 #include <string>
 #include <vector>
+
+namespace frnn::detail {
+
+void profileBuildEdgesAsync(DevicePointView query, DevicePointView database,
+                            DeviceEdgeBuffer output, float radius,
+                            int max_neighbors, BuildOptions options,
+                            Workspace& workspace, cudaStream_t stream,
+                            float* stage_milliseconds, int stage_count);
+
+}  // namespace frnn::detail
 
 namespace {
 
@@ -478,6 +489,39 @@ std::vector<double> measureWarmHost(const Case& benchmark_case, float radius,
   return samples;
 }
 
+constexpr int kStageCount = 9;
+constexpr const char* kStageNames[kStageCount] = {
+    "stage_grid_bounds",
+    "stage_cell_assignment",
+    "stage_grid_scan",
+    "stage_point_reorder",
+    "stage_neighbor_search",
+    "stage_edge_count",
+    "stage_edge_scan",
+    "stage_edge_write",
+    "stage_count_copy",
+};
+
+std::array<std::vector<double>, kStageCount> measureStages(
+    const Case& benchmark_case, float radius, const DeviceFixture& fixture,
+    frnn::Workspace& workspace, int iterations) {
+  std::array<std::vector<double>, kStageCount> samples;
+  for (auto& stage : samples) {
+    stage.reserve(iterations);
+  }
+  for (int iteration = 0; iteration < iterations; ++iteration) {
+    float milliseconds[kStageCount] = {};
+    frnn::detail::profileBuildEdgesAsync(
+        fixture.queryView(), fixture.databaseView(), fixture.outputView(),
+        radius, benchmark_case.max_neighbors, buildOptions(benchmark_case),
+        workspace, fixture.stream(), milliseconds, kStageCount);
+    for (int stage = 0; stage < kStageCount; ++stage) {
+      samples[stage].push_back(milliseconds[stage]);
+    }
+  }
+  return samples;
+}
+
 std::vector<double> measureColdHost(const Case& benchmark_case, float radius,
                                     const DeviceFixture& fixture,
                                     int iterations) {
@@ -688,6 +732,15 @@ int main(int argc, char** argv) {
                   benchmark_case, radius, fixture, workspace, options.warmup,
                   options.iterations)),
               properties, driver_version, runtime_version);
+      auto stage_samples =
+          measureStages(benchmark_case, radius, fixture, workspace,
+                        options.iterations);
+      for (int stage = 0; stage < kStageCount; ++stage) {
+        emitRow(*output, benchmark_case, radius, kStageNames[stage],
+                options.iterations,
+                summarize(std::move(stage_samples[stage])), properties,
+                driver_version, runtime_version);
+      }
       emitRow(*output, benchmark_case, radius, "device_warm_host",
               options.iterations,
               summarize(measureWarmHost(

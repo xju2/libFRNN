@@ -14,6 +14,11 @@
 namespace frnn {
 namespace {
 
+#if defined(FRNN_ENABLE_STAGE_PROFILING)
+constexpr int kProfileEventCount = 10;
+thread_local cudaEvent_t* active_profile_events = nullptr;
+#endif
+
 constexpr int kGridDimensions = 4;
 constexpr int kMaximumGridResolution = 128;
 constexpr int kMaximumGridCells3D = 128 * 1024;
@@ -40,6 +45,17 @@ void checkCuda(cudaError_t error, const char* operation) {
     throwCuda(error, operation);
   }
 }
+
+#if defined(FRNN_ENABLE_STAGE_PROFILING)
+void recordProfileEvent(int index, cudaStream_t stream) {
+  if (active_profile_events != nullptr) {
+    checkCuda(cudaEventRecord(active_profile_events[index], stream),
+              "record profiling event");
+  }
+}
+#else
+void recordProfileEvent(int, cudaStream_t) {}
+#endif
 
 int blocksFor(std::int64_t count) {
   if (count <= 0) {
@@ -955,7 +971,11 @@ void buildEdgesAsync(DevicePointView query, DevicePointView database,
   const int query_count = static_cast<int>(query.size);
   const int database_count = static_cast<int>(database.size);
   const int grid_cell_capacity = maximumGridCells(query.dimension);
+  recordProfileEvent(0, stream);
   if (algorithm == SearchAlgorithm::brute_force) {
+    for (int event = 1; event <= 4; ++event) {
+      recordProfileEvent(event, stream);
+    }
     launchBruteForceNeighbors(
         query.data, query_count, database.data, database_count,
         query.dimension, radius, max_neighbors, options.exclude_self,
@@ -974,6 +994,7 @@ void buildEdgesAsync(DevicePointView query, DevicePointView database,
         memory.bounds, grid_dimensions, grid_cell_capacity, radius,
         memory.grid_parameters);
     checkCuda(cudaPeekAtLastError(), "launch finalizeGrid");
+    recordProfileEvent(1, stream);
 
     checkCuda(cudaMemsetAsync(memory.grid_counts, 0,
                               grid_cell_capacity * sizeof(int), stream),
@@ -983,17 +1004,20 @@ void buildEdgesAsync(DevicePointView query, DevicePointView database,
         memory.grid_parameters, memory.grid_counts, memory.point_cells,
         memory.point_cell_indices);
     checkCuda(cudaPeekAtLastError(), "launch insertPoints");
+    recordProfileEvent(2, stream);
     checkCuda(cub::DeviceScan::ExclusiveSum(
                   memory.scan_temporary, memory.scan_temporary_bytes,
                   memory.grid_counts, memory.grid_offsets,
                   grid_cell_capacity,
                   stream),
               "prefix sum grid counts");
+    recordProfileEvent(3, stream);
     countingSort<<<blocksFor(database.size), kThreads, 0, stream>>>(
         database.data, database_count, database.dimension, memory.point_cells,
         memory.point_cell_indices, memory.grid_offsets,
         memory.sorted_database, memory.sorted_database_indices);
     checkCuda(cudaPeekAtLastError(), "launch countingSort");
+    recordProfileEvent(4, stream);
 
     const float* search_query =
         options.inputs_are_same ? memory.sorted_database : query.data;
@@ -1008,6 +1032,7 @@ void buildEdgesAsync(DevicePointView query, DevicePointView database,
         memory.neighbor_indices, stream);
     checkCuda(cudaPeekAtLastError(), "launch findNeighbors");
   }
+  recordProfileEvent(5, stream);
   checkCuda(cudaMemsetAsync(memory.edge_counts, 0,
                             (query.size + 1) * sizeof(std::int64_t), stream),
             "clear edge counts");
@@ -1015,22 +1040,71 @@ void buildEdgesAsync(DevicePointView query, DevicePointView database,
       memory.neighbor_indices, query_count, max_neighbors, options.undirected,
       memory.edge_counts);
   checkCuda(cudaPeekAtLastError(), "launch countEdges");
+  recordProfileEvent(6, stream);
   checkCuda(cub::DeviceScan::ExclusiveSum(
                 memory.scan_temporary, memory.scan_temporary_bytes,
                 memory.edge_counts, memory.edge_offsets, query_count + 1,
                 stream),
             "prefix sum edge counts");
+  recordProfileEvent(7, stream);
   if (!count_only) {
     writeEdges<<<blocksFor(query.size), kThreads, 0, stream>>>(
         memory.neighbor_indices, query_count, max_neighbors,
         options.undirected, memory.edge_offsets, output.edges);
     checkCuda(cudaPeekAtLastError(), "launch writeEdges");
   }
+  recordProfileEvent(8, stream);
   checkCuda(cudaMemcpyAsync(
                 output.edge_count, memory.edge_offsets + query_count,
                 sizeof(std::int64_t), cudaMemcpyDeviceToDevice, stream),
             "copy edge count");
+  recordProfileEvent(9, stream);
 }
+
+#if defined(FRNN_ENABLE_STAGE_PROFILING)
+namespace detail {
+
+void profileBuildEdgesAsync(DevicePointView query, DevicePointView database,
+                            DeviceEdgeBuffer output, float radius,
+                            int max_neighbors, BuildOptions options,
+                            Workspace& workspace, cudaStream_t stream,
+                            float* stage_milliseconds, int stage_count) {
+  if (stage_milliseconds == nullptr ||
+      stage_count != kProfileEventCount - 1) {
+    throw std::invalid_argument("invalid stage profiling output");
+  }
+  cudaEvent_t events[kProfileEventCount] = {};
+  for (cudaEvent_t& event : events) {
+    checkCuda(cudaEventCreate(&event), "create profiling event");
+  }
+  try {
+    active_profile_events = events;
+    buildEdgesAsync(query, database, output, radius, max_neighbors, options,
+                    workspace, stream);
+    active_profile_events = nullptr;
+    checkCuda(cudaEventSynchronize(events[kProfileEventCount - 1]),
+              "synchronize profiling events");
+    for (int stage = 0; stage < stage_count; ++stage) {
+      checkCuda(cudaEventElapsedTime(&stage_milliseconds[stage], events[stage],
+                                     events[stage + 1]),
+                "calculate stage elapsed time");
+    }
+  } catch (...) {
+    active_profile_events = nullptr;
+    for (cudaEvent_t event : events) {
+      if (event != nullptr) {
+        cudaEventDestroy(event);
+      }
+    }
+    throw;
+  }
+  for (cudaEvent_t event : events) {
+    cudaEventDestroy(event);
+  }
+}
+
+}  // namespace detail
+#endif
 
 std::vector<Edge> buildEdges(PointView query, PointView database, float radius,
                              int max_neighbors, BuildOptions options) {

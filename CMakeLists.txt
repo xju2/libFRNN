@@ -90,6 +90,7 @@ if(FRNN_BUILD_TESTS)
 endif()
 
 if(FRNN_BUILD_BENCHMARKS)
+    target_compile_definitions(frnn PRIVATE FRNN_ENABLE_STAGE_PROFILING=1)
     add_executable(frnn_benchmark benchmarks/frnn_benchmark.cu)
     target_link_libraries(frnn_benchmark PRIVATE frnn::frnn)
     target_compile_features(frnn_benchmark PRIVATE cxx_std_17)

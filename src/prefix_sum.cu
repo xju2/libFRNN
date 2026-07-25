@@ -32,7 +32,6 @@
 
 #include "cuda_runtime.h"
 #include "device_launch_parameters.h"
-#include "device_functions.h"
 
 #include "frnn/prefix_sum.h"
 
@@ -462,21 +461,21 @@ __global__ void add(int *output, int length, int *n1, int *n2) {
 void _checkCudaError(const char *message, cudaError_t err, const char *caller) {
 	if (err != cudaSuccess) {
 		fprintf(stderr, "Error in: %s\n", caller);
-		fprintf(stderr, message);
+		fprintf(stderr, "%s", message);
 		fprintf(stderr, ": %s\n", cudaGetErrorString(err));
-		exit(0);
+		exit(EXIT_FAILURE);
 	}
 }
 
 void printResult(const char* prefix, int result, long nanoseconds) {
 	printf("  ");
-	printf(prefix);
+	printf("%s", prefix);
 	printf(" : %i in %ld ms \n", result, nanoseconds / 1000);
 }
 
 void printResult(const char* prefix, int result, float milliseconds) {
 	printf("  ");
-	printf(prefix);
+	printf("%s", prefix);
 	printf(" : %i in %f ms \n", result, milliseconds);
 }
 

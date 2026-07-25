@@ -30,14 +30,22 @@ struct Edge {
   }
 };
 
+enum class SearchAlgorithm {
+  automatic,
+  grid,
+  brute_force,
+};
+
 struct BuildOptions {
   bool exclude_self = false;
   bool undirected = false;
   bool inputs_are_same = false;
+  SearchAlgorithm algorithm = SearchAlgorithm::automatic;
 };
 
 // Device output is a row-major [capacity, 2] array. edge_count is one
-// device-resident int64 value populated by buildEdgesAsync.
+// device-resident int64 value populated by buildEdgesAsync. Passing
+// edges=nullptr requests count-only execution and ignores capacity.
 struct DeviceEdgeBuffer {
   std::int64_t* edges = nullptr;
   std::int64_t capacity = 0;
@@ -58,7 +66,8 @@ class Workspace {
   void reserve(std::int64_t max_query_points,
                std::int64_t max_database_points,
                int dimension,
-               int max_neighbors);
+               int max_neighbors,
+               SearchAlgorithm algorithm = SearchAlgorithm::automatic);
   void clear() noexcept;
 
  private:
@@ -67,6 +76,8 @@ class Workspace {
   friend void buildEdgesAsync(DevicePointView, DevicePointView,
                               DeviceEdgeBuffer, float, int, BuildOptions,
                               Workspace&, cudaStream_t);
+  friend std::vector<Edge> buildEdges(PointView, PointView, float, int,
+                                      BuildOptions);
 };
 
 // Returns the conservative device output capacity required for a call.

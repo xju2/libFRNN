@@ -50,6 +50,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--r-max", type=float, default=0.12)
     parser.add_argument("--k-max", type=int, default=1000)
     parser.add_argument(
+        "--undirected",
+        action="store_true",
+        help=(
+            "Request one orientation per same-set pair. The supplied canonical "
+            "reference is directed, so directed output is the default."
+        ),
+    )
+    parser.add_argument(
         "--minimum-agreement",
         type=float,
         default=0.99,
@@ -233,7 +241,10 @@ def main() -> int:
     )
     start = time.perf_counter()
     actual_value = build_edges(
-        embedding_array, radius=args.r_max, max_neighbors=args.k_max
+        embedding_array,
+        radius=args.r_max,
+        max_neighbors=args.k_max,
+        directed=not args.undirected,
     )
 
     actual_edges = to_numpy_edges(actual_value)

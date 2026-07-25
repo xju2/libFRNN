@@ -7,6 +7,9 @@
 #include <cstdint>
 #include <cstdlib>
 #include <iostream>
+#include <limits>
+#include <random>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -27,26 +30,28 @@ void cudaRequire(cudaError_t error, const char* operation) {
   }
 }
 
-std::vector<frnn::Edge> bruteForce(const std::vector<float>& points,
-                                   int dimension, float radius,
-                                   int max_neighbors) {
-  const std::int64_t count =
-      static_cast<std::int64_t>(points.size() / dimension);
+std::vector<frnn::Edge> bruteForce(
+    const std::vector<float>& query, std::int64_t query_count,
+    const std::vector<float>& database, std::int64_t database_count,
+    int dimension, float radius, int max_neighbors,
+    frnn::BuildOptions options) {
   std::vector<frnn::Edge> result;
-  for (std::int64_t source = 0; source < count; ++source) {
+  const float radius_squared = radius * radius;
+  for (std::int64_t source = 0; source < query_count; ++source) {
     std::vector<std::pair<float, std::int64_t>> candidates;
-    for (std::int64_t target = 0; target < count; ++target) {
-      if (source == target) {
+    for (std::int64_t target = 0; target < database_count; ++target) {
+      if (options.exclude_self && options.inputs_are_same &&
+          source == target) {
         continue;
       }
       float distance = 0.0F;
       for (int axis = 0; axis < dimension; ++axis) {
         const float difference =
-            points[source * dimension + axis] -
-            points[target * dimension + axis];
+            query[source * dimension + axis] -
+            database[target * dimension + axis];
         distance += difference * difference;
       }
-      if (distance <= radius * radius) {
+      if (distance <= radius_squared) {
         candidates.emplace_back(distance, target);
       }
     }
@@ -59,12 +64,47 @@ std::vector<frnn::Edge> bruteForce(const std::vector<float>& points,
       candidates.resize(max_neighbors);
     }
     for (const auto& candidate : candidates) {
-      if (source > candidate.second) {
+      if (!options.undirected || source > candidate.second) {
         result.push_back({source, candidate.second});
       }
     }
   }
   return result;
+}
+
+std::vector<frnn::Edge> bruteForce(const std::vector<float>& points,
+                                   int dimension, float radius,
+                                   int max_neighbors) {
+  frnn::BuildOptions options;
+  options.exclude_self = true;
+  options.undirected = true;
+  options.inputs_are_same = true;
+  const std::int64_t count = static_cast<std::int64_t>(
+      points.size() / static_cast<std::size_t>(dimension));
+  return bruteForce(points, count, points, count, dimension, radius,
+                    max_neighbors, options);
+}
+
+void requireAgreement(const std::vector<float>& query,
+                      std::int64_t query_count,
+                      const std::vector<float>& database,
+                      std::int64_t database_count, int dimension,
+                      float radius, int max_neighbors,
+                      frnn::BuildOptions options,
+                      const std::string& context) {
+  const auto expected =
+      bruteForce(query, query_count, database, database_count, dimension,
+                 radius, max_neighbors, options);
+  const auto actual = frnn::buildEdges(
+      {query.data(), query_count, dimension},
+      {database.data(), database_count, dimension}, radius, max_neighbors,
+      options);
+  if (actual != expected) {
+    std::ostringstream message;
+    message << context << " disagrees with brute-force oracle: expected "
+            << expected.size() << " edges, got " << actual.size();
+    throw std::runtime_error(message.str());
+  }
 }
 
 void testReferenceAgreement() {
@@ -98,6 +138,21 @@ void testBoundaryTiesAndDuplicates() {
       frnn::buildEdges({duplicate.data(), 3, 3}, 0.1F, 1);
   require(duplicate_edges == std::vector<frnn::Edge>{{1, 0}, {2, 0}},
           "equal-distance ties must prefer the lower target index");
+
+  const float inside = std::nextafter(1.0F, 0.0F);
+  const float outside =
+      std::nextafter(1.0F, std::numeric_limits<float>::infinity());
+  std::vector<float> nextafter_points = {0.0F, 1.0F, inside, outside};
+  frnn::BuildOptions options;
+  options.inputs_are_same = true;
+  for (frnn::SearchAlgorithm algorithm :
+       {frnn::SearchAlgorithm::grid,
+        frnn::SearchAlgorithm::brute_force,
+        frnn::SearchAlgorithm::automatic}) {
+    options.algorithm = algorithm;
+    requireAgreement(nextafter_points, 4, nextafter_points, 4, 1, 1.0F, 4,
+                     options, "nextafter radius boundary");
+  }
 }
 
 void testEmptyAndInvalidInput() {
@@ -116,6 +171,121 @@ void testEmptyAndInvalidInput() {
     rejected = true;
   }
   require(rejected, "non-finite radius must be rejected");
+
+  point[0] = std::numeric_limits<float>::infinity();
+  rejected = false;
+  try {
+    static_cast<void>(frnn::buildEdges({point.data(), 1, 3}, 1.0F, 4));
+  } catch (const std::invalid_argument&) {
+    rejected = true;
+  }
+  require(rejected, "non-finite host coordinates must be rejected");
+}
+
+void testAllDispatchPaths() {
+  std::vector<float> points = {
+      0.0F, 0.0F, 0.0F, 0.25F, 0.0F, 0.0F,
+      0.5F, 0.0F, 0.0F, 0.75F, 0.0F, 0.0F,
+  };
+  frnn::BuildOptions options;
+  options.exclude_self = true;
+  options.undirected = true;
+  options.inputs_are_same = true;
+  for (frnn::SearchAlgorithm algorithm :
+       {frnn::SearchAlgorithm::grid,
+        frnn::SearchAlgorithm::brute_force,
+        frnn::SearchAlgorithm::automatic}) {
+    options.algorithm = algorithm;
+    requireAgreement(points, 4, points, 4, 3, 0.5F, 3, options,
+                     "explicit dispatch path");
+  }
+}
+
+void testRandomizedDifferential() {
+  constexpr int dimensions[] = {1, 2, 3, 4, 8, 16, 32};
+  constexpr int neighbor_counts[] = {0, 1, 4, 8, 16, 32, 64};
+  constexpr float radii[] = {1.0e-4F, 0.03F, 0.25F, 1.0F, 8.0F};
+  std::mt19937 generator(0x5eed1234U);
+  std::uniform_real_distribution<float> coordinate(-2.0F, 2.0F);
+
+  for (int case_index = 0; case_index < 1200; ++case_index) {
+    const int dimension =
+        dimensions[generator() % (sizeof(dimensions) / sizeof(*dimensions))];
+    const bool identical = (generator() & 1U) != 0;
+    const std::int64_t query_count = 1 + generator() % 18;
+    const std::int64_t database_count =
+        identical ? query_count : 1 + generator() % 18;
+    const int max_neighbors =
+        neighbor_counts[generator() %
+                        (sizeof(neighbor_counts) /
+                         sizeof(*neighbor_counts))];
+    const float radius =
+        radii[generator() % (sizeof(radii) / sizeof(*radii))];
+
+    std::vector<float> database(
+        static_cast<std::size_t>(database_count) * dimension);
+    for (float& value : database) {
+      value = coordinate(generator);
+    }
+    const int distribution = case_index % 6;
+    if (distribution == 1) {
+      for (float& value : database) {
+        value *= 0.01F;
+      }
+    } else if (distribution == 2 && database_count > 1) {
+      for (std::int64_t point_index = 1;
+           point_index < database_count; point_index += 3) {
+        std::copy_n(database.begin(), dimension,
+                    database.begin() + point_index * dimension);
+      }
+    } else if (distribution == 3) {
+      for (std::int64_t point_index = 0; point_index < database_count;
+           ++point_index) {
+        for (int axis = 1; axis < dimension; ++axis) {
+          database[point_index * dimension + axis] = 0.0F;
+        }
+      }
+    } else if (distribution == 4) {
+      for (std::int64_t point_index = 0; point_index < database_count;
+           ++point_index) {
+        const float base = database[point_index * dimension];
+        for (int axis = 1; axis < dimension; ++axis) {
+          database[point_index * dimension + axis] =
+              base + static_cast<float>(axis) * 0.001F;
+        }
+      }
+    } else if (distribution == 5) {
+      std::sort(database.begin(), database.end());
+    }
+
+    std::vector<float> query;
+    if (identical) {
+      query = database;
+    } else {
+      query.resize(static_cast<std::size_t>(query_count) * dimension);
+      for (float& value : query) {
+        value = coordinate(generator);
+      }
+    }
+
+    frnn::BuildOptions options;
+    options.exclude_self = identical && case_index % 3 != 0;
+    options.undirected = identical && case_index % 4 == 0;
+    options.inputs_are_same = identical;
+    for (frnn::SearchAlgorithm algorithm :
+         {frnn::SearchAlgorithm::grid,
+          frnn::SearchAlgorithm::brute_force,
+          frnn::SearchAlgorithm::automatic}) {
+      options.algorithm = algorithm;
+      std::ostringstream context;
+      context << "random case " << case_index << ", algorithm "
+              << static_cast<int>(algorithm) << ", dimension " << dimension
+              << ", K " << max_neighbors << ", radius " << radius;
+      requireAgreement(query, query_count, database, database_count,
+                       dimension, radius, max_neighbors, options,
+                       context.str());
+    }
+  }
 }
 
 void testCompatibilityLayout() {
@@ -201,6 +371,8 @@ int main() {
     testReferenceAgreement();
     testBoundaryTiesAndDuplicates();
     testEmptyAndInvalidInput();
+    testAllDispatchPaths();
+    testRandomizedDifferential();
     testCompatibilityLayout();
     testCallerStreamDeviceApi();
     std::cout << "All FRNN core tests passed\n";

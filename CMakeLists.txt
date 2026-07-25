@@ -5,6 +5,20 @@ project(libFRNN VERSION 1.0.0 LANGUAGES CXX CUDA)
 include(GNUInstallDirs)
 include(CMakePackageConfigHelpers)
 
+find_package(Git QUIET)
+if(Git_FOUND)
+    execute_process(
+        COMMAND "${GIT_EXECUTABLE}" rev-parse --short=12 HEAD
+        WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+        OUTPUT_VARIABLE FRNN_GIT_COMMIT
+        OUTPUT_STRIP_TRAILING_WHITESPACE
+        ERROR_QUIET
+    )
+endif()
+if(NOT FRNN_GIT_COMMIT)
+    set(FRNN_GIT_COMMIT "unknown")
+endif()
+
 option(BUILD_SHARED_LIBS "Build shared libraries instead of static libraries" ON)
 option(FRNN_BUILD_TESTS "Build FRNN tests" ON)
 option(FRNN_BUILD_BENCHMARKS "Build FRNN benchmarks" OFF)
@@ -76,7 +90,20 @@ if(FRNN_BUILD_TESTS)
 endif()
 
 if(FRNN_BUILD_BENCHMARKS)
-    message(STATUS "FRNN_BUILD_BENCHMARKS is enabled, but no benchmarks are currently defined")
+    add_executable(frnn_benchmark benchmarks/frnn_benchmark.cu)
+    target_link_libraries(frnn_benchmark PRIVATE frnn::frnn)
+    target_compile_features(frnn_benchmark PRIVATE cxx_std_17)
+    target_compile_definitions(frnn_benchmark PRIVATE
+        FRNN_GIT_COMMIT="${FRNN_GIT_COMMIT}"
+        FRNN_BUILD_TYPE="${CMAKE_BUILD_TYPE}"
+        FRNN_CXX_COMPILER="${CMAKE_CXX_COMPILER_ID} ${CMAKE_CXX_COMPILER_VERSION}"
+        FRNN_CUDA_COMPILER="${CMAKE_CUDA_COMPILER_ID} ${CMAKE_CUDA_COMPILER_VERSION}"
+        FRNN_CUDA_ARCHITECTURES="${CMAKE_CUDA_ARCHITECTURES}"
+    )
+    set_target_properties(frnn_benchmark PROPERTIES
+        CUDA_STANDARD 17
+        CUDA_STANDARD_REQUIRED ON
+    )
 endif()
 
 if(FRNN_BUILD_PYTHON)

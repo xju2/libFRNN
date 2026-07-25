@@ -208,7 +208,7 @@ void testRandomizedDifferential() {
   std::mt19937 generator(0x5eed1234U);
   std::uniform_real_distribution<float> coordinate(-2.0F, 2.0F);
 
-  for (int case_index = 0; case_index < 1200; ++case_index) {
+  for (int case_index = 0; case_index < 2500; ++case_index) {
     const int dimension =
         dimensions[generator() % (sizeof(dimensions) / sizeof(*dimensions))];
     const bool identical = (generator() & 1U) != 0;

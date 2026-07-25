@@ -62,9 +62,9 @@ costs:
 Nsight Systems 2025.5.2 is installed, but its QDSTRM importer is missing, so
 reports cannot be generated. Nsight Compute can attach, but hardware
 performance-counter access is denied (`ERR_NVGPUCTRPERM`). Resource usage was
-therefore inspected with `cuobjdump --dump-resource-usage`. The specialized
-D=8 grid kernel currently uses 48 registers and 64 bytes of stack per thread;
-D=16 uses 56 registers and 96 bytes of stack. This is why a large thread-local
+therefore inspected with `cuobjdump --dump-resource-usage`. The final
+specialized D=8 grid kernel uses 54 registers and 64 bytes of stack per thread;
+D=16 uses 62 registers and 96 bytes of stack. This is why a large thread-local
 K array was not added without a separate cooperative-selection design.
 Compute Sanitizer is also installed, but cannot start because its injection
 library `libsanitizer-collection.so` is absent from the installation.
@@ -210,8 +210,8 @@ The independent CPU oracle computes every dimension with `float`
 accumulation, includes `distance <= radius * radius`, sorts by `(distance,
 original index)`, truncates to K, and then applies edge post-processing.
 
-The C++ differential suite currently covers 1,200 randomized cases and all
-three dispatch choices, producing 3,600 forced/automatic comparisons per
+The C++ differential suite currently covers 2,500 randomized cases and all
+three dispatch choices, producing 7,500 forced/automatic comparisons per
 run. It varies dimensions 1, 2, 3, 4, 8, 16, and 32; K; radii; identical and
 separate inputs; directed and undirected output; empty neighborhoods; dense
 neighborhoods; duplicates; correlated, sorted, clustered, and degenerate
@@ -234,8 +234,8 @@ zero extra, precision and recall both 1.0.
 - CUDA Graph capture and a compact occupied-cell/sorted-key grid have not yet
   shown enough evidence to justify their complexity.
 
-The broad current matrix is in
-`benchmarks/results/matrix_current.csv`. It covers point counts through
+The broad final matrix is in
+`benchmarks/results/final_2a5da29.csv`. It covers point counts through
 500,000, dimensions 3/4/8/16, K 1 through 64, densities from empty through
 256 neighbors, identical and separate query sets, default and non-default
 streams, and uniform, clustered, separated-cluster, boundary, duplicate,

@@ -5,9 +5,60 @@ core has no dependency on Python, PyTorch, ATen, c10, TBB, NumPy, or a Python
 binding framework. The optional `frnn` Python package is a thin NumPy binding
 over the same installed C++ API.
 
-The current implementation supports dimensions 1 through 32 and uses a
-three-dimensional uniform grid (or all available dimensions for 1D/2D) to
-select candidates. Distances are evaluated over every input dimension.
+The implementation supports dimensions 1 through 32. It automatically
+dispatches small workloads to exact CUDA brute force and larger workloads to
+a dense uniform grid. The grid indexes up to three coordinates for dimensions
+1–4 and four coordinates for dimensions 5–32; candidate distances always use
+every input dimension.
+
+## Algorithm and exactness
+
+Both production search paths implement the same canonical result:
+
+1. accumulate squared Euclidean distance in `float32` dimension order;
+2. include candidates whose squared distance is less than or equal to
+   `radius * radius`;
+3. order each query row by `(squared_distance, original_database_index)`;
+4. retain the first `max_neighbors` entries;
+5. apply self-loop and directed/undirected edge filtering.
+
+Neighbor indices and final edges are exact, not recall-based. Duplicate
+coordinates retain distinct original indices, radius boundaries are
+inclusive, and equal-distance ties prefer the lower original index. Internal
+squared distances are not part of the public output. The test oracle uses the
+same `float32` accumulation contract and includes exact-boundary and adjacent
+`nextafter` cases.
+
+The grid path builds bounds, assigns database points to dense cells, performs
+a prefix sum and counting sort, and searches only cells intersecting each
+query radius. Identical query/reference calls process queries in the existing
+spatial ordering and write results back by original index. Specialized
+distance kernels cover dimensions 1, 2, 3, 4, 8, 12, and 16, with a generic
+exact path through dimension 32. Distance evaluation exits when its
+non-negative partial sum already exceeds the radius.
+
+For large K, selection begins as a sorted insertion list and converts to a
+deterministic max-heap only after a query accepts 24 candidates. This avoids
+heap overhead for sparse queries and avoids quadratic insertion shifting for
+dense queries. An internal `-1` index marks the end of a short neighbor row;
+sentinels are not exposed in edge output.
+
+Automatic brute-force dispatch uses this overflow-safe work rule:
+
+```text
+query_count * database_count * dimension * ceil(max_neighbors / 8)
+    <= 2,000,000
+```
+
+Callers can force either exact path for measurement or diagnosis:
+
+```cpp
+frnn::BuildOptions options;
+options.algorithm = frnn::SearchAlgorithm::grid;
+// or frnn::SearchAlgorithm::brute_force
+```
+
+The forced choices change only the algorithm, not result semantics.
 
 ## C++ installation and use
 
@@ -70,12 +121,22 @@ reside on the active CUDA device, a caller-owned `DeviceEdgeBuffer`, a reusable
 `Workspace`, and a caller-provided `cudaStream_t`. The output edge storage is
 row-major `[capacity, 2]`; `edge_count` is a device-resident signed 64-bit
 scalar. Use `requiredEdgeCapacity(query_count, max_neighbors)` to size it.
+Passing `edges=nullptr` requests count-only execution; in that mode `capacity`
+is ignored and the exact device-resident count is still populated.
 
 Every memory operation, prefix sum, and kernel is enqueued on the supplied
 stream. The device API does not copy input coordinates to the host. Call
 `Workspace::reserve` before an asynchronous region to avoid allocation-related
-synchronization when a workspace grows. The host convenience API performs
-host-to-device input copies, synchronizes, and copies its output to the host.
+synchronization when a workspace grows. A reserved workspace has no per-call
+allocation on the warm path. Use a separate workspace for concurrently
+executing calls.
+
+The device API does not synchronize the supplied stream. It reports launch and
+CUDA API errors immediately; execution errors are observed when the caller
+synchronizes. Device callers must provide finite coordinates because checking
+device values on the host would break asynchronous execution. The synchronous
+host API validates all coordinates, copies inputs to the device, runs
+count-first, allocates exact edge storage, and copies the output to the host.
 
 ## Python installation and use
 
@@ -167,3 +228,59 @@ python tests/test_python.py
 The original kernel sources were derived from
 <https://github.com/murnanedaniel/FRNN> and
 <https://github.com/lxxue/prefix_sum>.
+
+## Benchmarking
+
+Build and run the reproducible benchmark with:
+
+```bash
+cmake -S . -B build \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DFRNN_BUILD_TESTS=ON \
+  -DFRNN_BUILD_BENCHMARKS=ON
+cmake --build build --parallel
+./build/frnn_benchmark \
+  --full \
+  --warmup 10 \
+  --iterations 50 \
+  --output benchmarks/results/local.csv
+```
+
+The CSV contains build/compiler/GPU metadata and separate rows for workspace
+allocation, cold device latency, warm CUDA-event latency, synchronized device
+host latency, device-to-host output transfer, and host API end-to-end latency.
+It reports minimum, p50, p95, mean, and standard deviation.
+
+The supplied real embedding can be measured without including CSV parsing in
+the timed region:
+
+```bash
+./build/frnn_benchmark \
+  --embedding data/embedding_data.csv \
+  --warmup 10 \
+  --iterations 30 \
+  --output benchmarks/results/local-real.csv
+
+python tests/compare_reference_edges.py --minimum-agreement 1.0
+```
+
+Use `--algorithm grid` or `--algorithm brute_force` to measure crossover
+points. The immutable baseline, retained experiments, and final machine-
+readable data live in `benchmarks/results/`. Profiling observations, rejected
+experiments, and remaining bottlenecks are in
+`docs/optimization_log.md`; the final comparison is in
+`docs/performance_report.md`.
+
+## Known limitations
+
+- Dimensions above four use the first four coordinates for grid indexing,
+  although distance and acceptance use every coordinate.
+- Dense or highly correlated high-dimensional clouds can still generate many
+  candidates and dominate latency.
+- The host convenience API is synchronous and creates a fresh device workspace
+  per call; repeated low-latency applications should use the device API and a
+  reserved workspace.
+- Device output capacity remains caller-managed. Count-only mode is available
+  when allocating the conservative capacity is undesirable.
+- The current library supports any non-negative K that fits device memory; it
+  does not expose neighbor distances as a public output.

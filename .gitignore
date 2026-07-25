@@ -37,3 +37,4 @@ build/
 .venv*/
 dist/
 install/
+install-*/

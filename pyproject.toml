@@ -1,0 +1,62 @@
+[build-system]
+requires = [
+  "scikit-build-core>=0.10",
+  "pybind11>=2.11",
+]
+build-backend = "scikit_build_core.build"
+
+[project]
+name = "frnn"
+version = "1.0.0"
+description = "Standalone CUDA fixed-radius nearest-neighbor library"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { file = "LICENSE" }
+authors = [{ name = "libFRNN contributors" }]
+dependencies = ["numpy>=1.23"]
+classifiers = [
+  "Programming Language :: C++",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: Implementation :: CPython",
+  "Operating System :: POSIX :: Linux",
+]
+
+[project.urls]
+Repository = "https://github.com/xju2/libFRNN"
+
+[tool.scikit-build]
+cmake.version = ">=3.20"
+wheel.packages = ["python/frnn"]
+sdist.include = [
+  "CMakeLists.txt",
+  "Config.cmake.in",
+  "LICENSE",
+  "README.md",
+  "src/frnn.cu",
+  "src/include/frnn/*.hpp",
+  "python/bindings.cpp",
+  "python/frnn/*.py",
+  "tests/*.cpp",
+  "tests/*.py",
+  "tests/consumer/CMakeLists.txt",
+  "tests/consumer/*.cpp",
+]
+sdist.exclude = [
+  ".git/**",
+  ".venv*/**",
+  "build*/**",
+  "install*/**",
+  "dist/**",
+  "data/**",
+  ".ruff_cache/**",
+  "**/__pycache__/**",
+  "tests/__pycache__/**",
+  "**/*.pyc",
+  "tests/*.pyc",
+]
+
+[tool.scikit-build.cmake.define]
+FRNN_BUILD_PYTHON = "ON"
+FRNN_BUILD_TESTS = "OFF"
+FRNN_BUILD_BENCHMARKS = "OFF"
+BUILD_SHARED_LIBS = "OFF"

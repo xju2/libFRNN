@@ -59,20 +59,6 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
-        "--input-backend",
-        choices=("numpy", "torch"),
-        default="numpy",
-        help=(
-            "Pass a NumPy array to build_edges, or convert it to a Torch tensor "
-            "(default: numpy)."
-        ),
-    )
-    parser.add_argument(
-        "--device",
-        default="cuda",
-        help="Torch device used with --input-backend=torch (default: cuda).",
-    )
-    parser.add_argument(
         "--examples",
         type=int,
         default=10,
@@ -146,28 +132,7 @@ def load_callable(module_name: str, function_name: str) -> Any:
     return function
 
 
-def prepare_embedding(embedding: np.ndarray, input_backend: str, device: str) -> Any:
-    if input_backend == "numpy":
-        return embedding
-
-    try:
-        import torch
-    except ImportError as error:
-        raise RuntimeError(
-            "--input-backend=torch requires PyTorch to be installed"
-        ) from error
-
-    return torch.from_numpy(embedding).to(device)
-
-
 def to_numpy_edges(value: Any) -> np.ndarray:
-    if hasattr(value, "detach"):
-        value = value.detach()
-    if hasattr(value, "cpu"):
-        value = value.cpu()
-    if hasattr(value, "numpy"):
-        value = value.numpy()
-
     edges = np.asarray(value)
     if edges.ndim != 2:
         raise ValueError(f"build_edges returned shape {edges.shape}; expected 2-D")
@@ -261,15 +226,15 @@ def main() -> int:
     num_nodes = embedding_array.shape[0]
     reference, reference_duplicates = load_reference(args.reference, num_nodes)
 
-    embedding = prepare_embedding(embedding_array, args.input_backend, args.device)
-
     print(
         f"Calling {args.module}.{args.function}"
-        f"(embedding, embedding, r_max={args.r_max}, k_max={args.k_max}) ...",
+        f"(embedding, radius={args.r_max}, max_neighbors={args.k_max}) ...",
         flush=True,
     )
     start = time.perf_counter()
-    actual_value = build_edges(embedding, embedding, r_max=args.r_max, k_max=args.k_max)
+    actual_value = build_edges(
+        embedding_array, radius=args.r_max, max_neighbors=args.k_max
+    )
 
     actual_edges = to_numpy_edges(actual_value)
     elapsed = time.perf_counter() - start

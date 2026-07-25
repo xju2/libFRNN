@@ -66,6 +66,8 @@ therefore inspected with `cuobjdump --dump-resource-usage`. The specialized
 D=8 grid kernel currently uses 48 registers and 64 bytes of stack per thread;
 D=16 uses 56 registers and 96 bytes of stack. This is why a large thread-local
 K array was not added without a separate cooperative-selection design.
+Compute Sanitizer is also installed, but cannot start because its injection
+library `libsanitizer-collection.so` is absent from the installation.
 
 ## Experiments
 

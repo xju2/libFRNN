@@ -358,6 +358,69 @@ void testCallerStreamDeviceApi() {
   require(actual == bruteForce(points, dimension, 0.5F, max_neighbors),
           "device API result disagrees with reference");
 
+  frnn::buildEdgesAsync(
+      {device_points, point_count, dimension},
+      {device_points, point_count, dimension},
+      {nullptr, 0, device_count}, 0.5F, max_neighbors, options, workspace,
+      stream);
+  edge_count = -1;
+  cudaRequire(cudaMemcpyAsync(&edge_count, device_count, sizeof(edge_count),
+                              cudaMemcpyDeviceToHost, stream),
+              "copy count-only result");
+  cudaRequire(cudaStreamSynchronize(stream), "synchronize count-only result");
+  require(edge_count ==
+              static_cast<std::int64_t>(
+                  bruteForce(points, dimension, 0.5F, max_neighbors).size()),
+          "count-only device API returned the wrong edge count");
+
+  for (int iteration = 0; iteration < 6; ++iteration) {
+    const std::int64_t active_count = iteration % 2 == 0 ? 2 : point_count;
+    frnn::buildEdgesAsync(
+        {device_points, active_count, dimension},
+        {device_points, active_count, dimension},
+        {device_edges, capacity, device_count}, 0.5F, max_neighbors, options,
+        workspace, stream);
+    edge_count = 0;
+    cudaRequire(cudaMemcpyAsync(&edge_count, device_count, sizeof(edge_count),
+                                cudaMemcpyDeviceToHost, stream),
+                "copy alternating-size edge count");
+    cudaRequire(cudaMemcpyAsync(actual.data(), device_edges,
+                                capacity * sizeof(frnn::Edge),
+                                cudaMemcpyDeviceToHost, stream),
+                "copy alternating-size edges");
+    cudaRequire(cudaStreamSynchronize(stream),
+                "synchronize alternating-size call");
+    const std::vector<float> active_points(
+        points.begin(), points.begin() + active_count * dimension);
+    const auto expected =
+        bruteForce(active_points, dimension, 0.5F, max_neighbors);
+    actual.resize(static_cast<std::size_t>(edge_count));
+    require(actual == expected,
+            "reused workspace disagrees after alternating input sizes");
+    actual.resize(static_cast<std::size_t>(capacity));
+  }
+
+  frnn::Workspace default_stream_workspace;
+  default_stream_workspace.reserve(point_count, point_count, dimension,
+                                   max_neighbors);
+  frnn::buildEdgesAsync(
+      {device_points, point_count, dimension},
+      {device_points, point_count, dimension},
+      {device_edges, capacity, device_count}, 0.5F, max_neighbors, options,
+      default_stream_workspace, nullptr);
+  edge_count = 0;
+  cudaRequire(cudaMemcpy(&edge_count, device_count, sizeof(edge_count),
+                         cudaMemcpyDeviceToHost),
+              "copy default-stream edge count");
+  actual.resize(static_cast<std::size_t>(capacity));
+  cudaRequire(cudaMemcpy(actual.data(), device_edges,
+                         capacity * sizeof(frnn::Edge),
+                         cudaMemcpyDeviceToHost),
+              "copy default-stream edges");
+  actual.resize(static_cast<std::size_t>(edge_count));
+  require(actual == bruteForce(points, dimension, 0.5F, max_neighbors),
+          "default-stream result disagrees with reference");
+
   cudaFree(device_count);
   cudaFree(device_edges);
   cudaFree(device_points);

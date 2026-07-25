@@ -11,6 +11,7 @@ It depends on `PyTorch` and `CUDA`, and `TBB` (needed for Pytorch).
 ## To build
 
 ```bash
-cmake .. -DCMAKE_PREFIX_PATH=$(python -c 'import torch;print(torch.utils.cmake_prefix_path)')
+cmake -DCMAKE_PREFIX_PATH=$(python -c 'import torch;print(torch.utils.cmake_prefix_path)') -S . -B build
+cmake --build build --config Release
 ```
 

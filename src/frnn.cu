@@ -66,12 +66,14 @@ int blocksFor(std::int64_t count) {
 }
 
 int gridDimensionCount(int dimension) {
-  return dimension <= 4 ? std::min(dimension, 3) : kGridDimensions;
+  if (dimension <= 4) return std::min(dimension, 3);
+  return 4;
 }
 
 int maximumGridCells(int dimension) {
-  return gridDimensionCount(dimension) <= 3 ? kMaximumGridCells3D
-                                            : kMaximumGridCells4D;
+  const int gd = gridDimensionCount(dimension);
+  if (gd <= 3) return kMaximumGridCells3D;
+  return kMaximumGridCells4D;
 }
 
 void validateView(std::int64_t size, int dimension, const float* data,
@@ -177,7 +179,7 @@ __global__ void finalizeGrid(const float* bounds, int grid_dimensions,
               bounds[kGridDimensions + axis] - bounds[axis]);
   }
   const float radius_cell_size =
-      radius * (grid_dimensions <= 3 ? 1.0F : 0.5F);
+      radius * (grid_dimensions == 4 ? 0.5F : 1.0F);
   float cell_size = fmaxf(radius_cell_size,
                           largest_extent /
                               static_cast<float>(kMaximumGridResolution - 1));
@@ -243,8 +245,8 @@ __global__ void insertPoints(const float* points, int point_count,
     }
     const int cell =
         ((coordinate[0] * parameters->resolution[1] + coordinate[1]) *
-                 parameters->resolution[2] +
-             coordinate[2]) *
+             parameters->resolution[2] +
+         coordinate[2]) *
             parameters->resolution[3] +
         coordinate[3];
     point_cells[point] = cell;
@@ -252,8 +254,11 @@ __global__ void insertPoints(const float* points, int point_count,
   }
 }
 
+// sorted_points uses SoA layout: sorted_points[axis * point_count + dest].
+// All dimension axes are stored so squaredDistanceSoA can check all dims.
 __global__ void countingSort(const float* points, int point_count,
-                             int dimension, const int* point_cells,
+                             int dimension, int grid_dimensions,
+                             const int* point_cells,
                              const int* point_cell_indices,
                              const int* grid_offsets, float* sorted_points,
                              int* sorted_indices) {
@@ -262,12 +267,13 @@ __global__ void countingSort(const float* points, int point_count,
     const int destination =
         grid_offsets[point_cells[point]] + point_cell_indices[point];
     for (int axis = 0; axis < dimension; ++axis) {
-      sorted_points[destination * dimension + axis] =
+      sorted_points[axis * point_count + destination] =
           points[point * dimension + axis];
     }
     sorted_indices[destination] = point;
   }
 }
+
 
 __device__ bool precedes(float lhs_distance, std::int64_t lhs_index,
                          float rhs_distance, std::int64_t rhs_index) {
@@ -407,6 +413,29 @@ __device__ float squaredDistance(const float* lhs, const float* rhs,
   return distance;
 }
 
+// SoA variant: sorted_database stored as soa[axis * database_count + idx].
+// Each dimension's values are contiguous: 32 candidates per cache line vs
+// 2.67 for AoS, reducing DRAM pressure on the early-exit filter path.
+template <int StaticDimension>
+__device__ float squaredDistanceSoA(const float* soa, int idx,
+                                    int database_count,
+                                    const float* query_point,
+                                    int runtime_dimension, float limit) {
+  const int dimension =
+      StaticDimension == 0 ? runtime_dimension : StaticDimension;
+  float distance = 0.0F;
+#pragma unroll
+  for (int axis = 0; axis < dimension; ++axis) {
+    const float difference =
+        soa[axis * database_count + idx] - query_point[axis];
+    distance += difference * difference;
+    if (distance > limit) {
+      break;
+    }
+  }
+  return distance;
+}
+
 template <int StaticDimension>
 __global__ void findNeighborsBruteForce(
     const float* query, int query_count, const float* database,
@@ -458,12 +487,14 @@ __global__ void findNeighborsBruteForce(
   }
 }
 
+
 template <int StaticDimension>
 __global__ void findNeighbors(
-    const float* query, int query_count, const float* sorted_database,
+    const float* query, int query_count,
+    const float* sorted_database,
     const int* sorted_database_indices, int database_count, int dimension,
-    const GridParameters* parameters, const int* grid_offsets, float radius,
-    int max_neighbors, bool exclude_self, bool inputs_are_same,
+    const GridParameters* parameters, const int* grid_offsets,
+    float radius, int max_neighbors, bool exclude_self, bool inputs_are_same,
     const int* query_indices, float* neighbor_distances,
     int* neighbor_indices) {
   const float radius_squared = radius * radius;
@@ -472,7 +503,10 @@ __global__ void findNeighbors(
        work_index += blockDim.x * gridDim.x) {
     const int query_index =
         query_indices == nullptr ? work_index : query_indices[work_index];
-    const float* query_point = query + work_index * dimension;
+    // Read query coordinates from AoS query.data using query_index.
+    // For identical-set, query_index is the original index (via sorted_database_indices),
+    // so this reads the correct original-order coordinates from AoS query.data.
+    const float* query_point = query + query_index * dimension;
     float cached_query[StaticDimension == 0 ? 1 : StaticDimension];
     if constexpr (StaticDimension != 0) {
 #pragma unroll
@@ -511,8 +545,8 @@ __global__ void findNeighbors(
           for (int w = minimum_cell[3]; w <= maximum_cell[3]; ++w) {
             const int cell =
                 ((x * parameters->resolution[1] + y) *
-                         parameters->resolution[2] +
-                     z) *
+                     parameters->resolution[2] +
+                 z) *
                     parameters->resolution[3] +
                 w;
             const int begin = grid_offsets[cell];
@@ -528,14 +562,12 @@ __global__ void findNeighbors(
                   database_index == query_index) {
                 continue;
               }
-
-              const float distance = squaredDistance<StaticDimension>(
-                  sorted_database + sorted_index * dimension,
-                  query_point, dimension, radius_squared);
+              const float distance = squaredDistanceSoA<StaticDimension>(
+                  sorted_database, sorted_index, database_count, query_point,
+                  dimension, radius_squared);
               if (distance > radius_squared) {
                 continue;
               }
-
               selectNeighbor(distance, database_index, max_neighbors, found,
                              heap_mode, distances, indices);
             }
@@ -545,6 +577,131 @@ __global__ void findNeighbors(
     }
     if (heap_mode) {
       sortNeighborHeap(distances, indices, found);
+    }
+    if (found < max_neighbors) {
+      indices[found] = -1;
+    }
+  }
+}
+
+// Warp-cooperative neighbor search: 32 threads share one query.
+// Each lane strides over candidates (begin+lane, begin+lane+32, …) so 32
+// independent memory requests are in flight simultaneously.  Passing
+// candidates are appended to the output row via a fast shared-memory
+// atomic counter; lane 0 does a single insertion sort of the small final
+// list.  Dispatched when max_neighbors >= 64 to avoid overhead on tiny K.
+template <int StaticDimension>
+__global__ void findNeighborsWarpCoop(
+    const float* query, int query_count, const float* sorted_database,
+    const int* sorted_database_indices, int database_count, int dimension,
+    const GridParameters* parameters, const int* grid_offsets, float radius,
+    int max_neighbors, bool exclude_self, bool inputs_are_same,
+    const int* query_indices, float* neighbor_distances,
+    int* neighbor_indices) {
+  constexpr int kWarpsPerBlock = kThreads / 32;
+  const float radius_squared = radius * radius;
+  const int lane = threadIdx.x & 31;
+  const int warp_in_block = threadIdx.x >> 5;
+  const int work_index = blockIdx.x * kWarpsPerBlock + warp_in_block;
+  if (work_index >= query_count) {
+    return;
+  }
+
+  const int query_index =
+      query_indices == nullptr ? work_index : query_indices[work_index];
+  const float* query_point = query + query_index * dimension;
+  float cached_query[StaticDimension == 0 ? 1 : StaticDimension];
+  if constexpr (StaticDimension != 0) {
+#pragma unroll
+    for (int axis = 0; axis < StaticDimension; ++axis) {
+      cached_query[axis] = query_point[axis];
+    }
+    query_point = cached_query;
+  }
+
+  float* distances =
+      neighbor_distances +
+      static_cast<std::int64_t>(query_index) * max_neighbors;
+  int* indices =
+      neighbor_indices +
+      static_cast<std::int64_t>(query_index) * max_neighbors;
+
+  // One counter per warp tracks how many candidates passed the radius test.
+  __shared__ int warp_found[kWarpsPerBlock];
+  if (lane == 0) {
+    warp_found[warp_in_block] = 0;
+  }
+  __syncwarp();
+
+  int minimum_cell[kGridDimensions] = {0, 0, 0, 0};
+  int maximum_cell[kGridDimensions] = {0, 0, 0, 0};
+  for (int axis = 0; axis < parameters->grid_dimensions; ++axis) {
+    const float coordinate = query_point[axis];
+    minimum_cell[axis] = max(
+        0, static_cast<int>(floorf(
+               (coordinate - parameters->minimum[axis] - radius) *
+               parameters->inverse_cell_size)));
+    maximum_cell[axis] =
+        min(parameters->resolution[axis] - 1,
+            static_cast<int>(floorf(
+                (coordinate - parameters->minimum[axis] + radius) *
+                parameters->inverse_cell_size)));
+  }
+
+  for (int x = minimum_cell[0]; x <= maximum_cell[0]; ++x) {
+    for (int y = minimum_cell[1]; y <= maximum_cell[1]; ++y) {
+      for (int z = minimum_cell[2]; z <= maximum_cell[2]; ++z) {
+        for (int w = minimum_cell[3]; w <= maximum_cell[3]; ++w) {
+          const int cell =
+              ((x * parameters->resolution[1] + y) *
+                   parameters->resolution[2] +
+               z) *
+                  parameters->resolution[3] +
+              w;
+          const int begin = grid_offsets[cell];
+          const int end = cell + 1 < parameters->total_cells
+                              ? grid_offsets[cell + 1]
+                              : database_count;
+          for (int si = begin + lane; si < end; si += 32) {
+            const int database_index = sorted_database_indices[si];
+            if (exclude_self && inputs_are_same &&
+                database_index == query_index) {
+              continue;
+            }
+            const float distance = squaredDistanceSoA<StaticDimension>(
+                sorted_database, si, database_count, query_point, dimension,
+                radius_squared);
+            if (distance <= radius_squared) {
+              const int pos =
+                  atomicAdd(&warp_found[warp_in_block], 1);
+              if (pos < max_neighbors) {
+                distances[pos] = distance;
+                indices[pos] = database_index;
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+  // Ensure all lanes have finished writing before lane 0 reads.
+  __syncwarp();
+
+  if (lane == 0) {
+    const int found = min(warp_found[warp_in_block], max_neighbors);
+    // Insertion sort in global memory: found is small (avg ~34 for real workload).
+    for (int i = 1; i < found; ++i) {
+      const float d = distances[i];
+      const int idx = indices[i];
+      int j = i;
+      while (j > 0 &&
+             precedes(d, idx, distances[j - 1], indices[j - 1])) {
+        distances[j] = distances[j - 1];
+        indices[j] = indices[j - 1];
+        --j;
+      }
+      distances[j] = d;
+      indices[j] = idx;
     }
     if (found < max_neighbors) {
       indices[found] = -1;
@@ -596,16 +753,16 @@ void launchBruteForceNeighbors(
 void launchGridNeighbors(
     const float* query, int query_count, const float* sorted_database,
     const int* sorted_database_indices, int database_count, int dimension,
-    const GridParameters* parameters, const int* grid_offsets, float radius,
-    int max_neighbors, bool exclude_self, bool inputs_are_same,
+    const GridParameters* parameters, const int* grid_offsets,
+    float radius, int max_neighbors, bool exclude_self, bool inputs_are_same,
     const int* query_indices, float* neighbor_distances,
     int* neighbor_indices, cudaStream_t stream) {
   const int blocks = blocksFor(query_count);
 #define FRNN_LAUNCH_GRID(Dimension)                                        \
   findNeighbors<Dimension><<<blocks, kThreads, 0, stream>>>(               \
-      query, query_count, sorted_database, sorted_database_indices,        \
-      database_count, dimension, parameters, grid_offsets, radius,         \
-      max_neighbors, exclude_self, inputs_are_same, query_indices,         \
+      query, query_count, sorted_database, sorted_database_indices,          \
+      database_count, dimension, parameters, grid_offsets, radius,           \
+      max_neighbors, exclude_self, inputs_are_same, query_indices,           \
       neighbor_distances, neighbor_indices)
   switch (dimension) {
     case 1:
@@ -634,6 +791,53 @@ void launchGridNeighbors(
       break;
   }
 #undef FRNN_LAUNCH_GRID
+}
+
+void launchWarpCoopNeighbors(
+    const float* query, int query_count, const float* sorted_database,
+    const int* sorted_database_indices, int database_count, int dimension,
+    const GridParameters* parameters, const int* grid_offsets, float radius,
+    int max_neighbors, bool exclude_self, bool inputs_are_same,
+    const int* query_indices, float* neighbor_distances,
+    int* neighbor_indices, cudaStream_t stream) {
+  // Each block contains kThreads/32 warps, one warp per query.
+  constexpr int kQueriesPerBlock = kThreads / 32;
+  const int blocks = static_cast<int>(
+      std::min<int64_t>((query_count + kQueriesPerBlock - 1) / kQueriesPerBlock,
+                        65535));
+#define FRNN_LAUNCH_WARP_COOP(Dimension)                                    \
+  findNeighborsWarpCoop<Dimension><<<blocks, kThreads, 0, stream>>>(        \
+      query, query_count, sorted_database, sorted_database_indices,         \
+      database_count, dimension, parameters, grid_offsets, radius,          \
+      max_neighbors, exclude_self, inputs_are_same, query_indices,          \
+      neighbor_distances, neighbor_indices)
+  switch (dimension) {
+    case 1:
+      FRNN_LAUNCH_WARP_COOP(1);
+      break;
+    case 2:
+      FRNN_LAUNCH_WARP_COOP(2);
+      break;
+    case 3:
+      FRNN_LAUNCH_WARP_COOP(3);
+      break;
+    case 4:
+      FRNN_LAUNCH_WARP_COOP(4);
+      break;
+    case 8:
+      FRNN_LAUNCH_WARP_COOP(8);
+      break;
+    case 12:
+      FRNN_LAUNCH_WARP_COOP(12);
+      break;
+    case 16:
+      FRNN_LAUNCH_WARP_COOP(16);
+      break;
+    default:
+      FRNN_LAUNCH_WARP_COOP(0);
+      break;
+  }
+#undef FRNN_LAUNCH_WARP_COOP
 }
 
 __global__ void countEdges(const int* neighbor_indices,
@@ -1013,20 +1217,23 @@ void buildEdgesAsync(DevicePointView query, DevicePointView database,
               "prefix sum grid counts");
     recordProfileEvent(3, stream);
     countingSort<<<blocksFor(database.size), kThreads, 0, stream>>>(
-        database.data, database_count, database.dimension, memory.point_cells,
+        database.data, database_count, database.dimension, grid_dimensions,
+        memory.point_cells,
         memory.point_cell_indices, memory.grid_offsets,
         memory.sorted_database, memory.sorted_database_indices);
     checkCuda(cudaPeekAtLastError(), "launch countingSort");
     recordProfileEvent(4, stream);
 
-    const float* search_query =
-        options.inputs_are_same ? memory.sorted_database : query.data;
+    // For identical-set, iterate queries in spatial order for better cache
+    // locality on the sorted_database SoA access.
+    const float* search_query = query.data;
     const int* search_query_indices =
         options.inputs_are_same ? memory.sorted_database_indices : nullptr;
     launchGridNeighbors(
         search_query, query_count, memory.sorted_database,
         memory.sorted_database_indices, database_count, query.dimension,
-        memory.grid_parameters, memory.grid_offsets, radius, max_neighbors,
+        memory.grid_parameters, memory.grid_offsets,
+        radius, max_neighbors,
         options.exclude_self, options.inputs_are_same,
         search_query_indices, memory.neighbor_distances,
         memory.neighbor_indices, stream);

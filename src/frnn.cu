@@ -24,6 +24,7 @@ constexpr int kMaximumGridResolution = 128;
 constexpr int kMaximumGridCells3D = 128 * 1024;
 constexpr int kMaximumGridCells4D = 128 * 128 * 128;
 constexpr int kThreads = 256;
+constexpr int kSearchThreads = 128;
 constexpr std::int64_t kBruteForceCoordinateWork = 2'000'000;
 
 struct GridParameters {
@@ -539,10 +540,36 @@ __global__ void findNeighbors(
                   parameters->inverse_cell_size)));
     }
 
+    const float cell_size = 1.0f / parameters->inverse_cell_size;
     for (int x = minimum_cell[0]; x <= maximum_cell[0]; ++x) {
       for (int y = minimum_cell[1]; y <= maximum_cell[1]; ++y) {
         for (int z = minimum_cell[2]; z <= maximum_cell[2]; ++z) {
           for (int w = minimum_cell[3]; w <= maximum_cell[3]; ++w) {
+            // Skip cell if its minimum 4D distance to the query already
+            // exceeds the search radius (no candidate in the cell can pass).
+            {
+              const float cn0 = parameters->minimum[0] + x * cell_size;
+              const float g0 = fmaxf(0.0f, fmaxf(cn0 - query_point[0],
+                                                   query_point[0] - cn0 - cell_size));
+              float sq = g0 * g0;
+              const float cn1 = parameters->minimum[1] + y * cell_size;
+              const float g1 = fmaxf(0.0f, fmaxf(cn1 - query_point[1],
+                                                   query_point[1] - cn1 - cell_size));
+              sq += g1 * g1;
+              if (sq > radius_squared) continue;
+              const float cn2 = parameters->minimum[2] + z * cell_size;
+              const float g2 = fmaxf(0.0f, fmaxf(cn2 - query_point[2],
+                                                   query_point[2] - cn2 - cell_size));
+              sq += g2 * g2;
+              if (sq > radius_squared) continue;
+              if (parameters->grid_dimensions >= 4) {
+                const float cn3 = parameters->minimum[3] + w * cell_size;
+                const float g3 = fmaxf(0.0f, fmaxf(cn3 - query_point[3],
+                                                     query_point[3] - cn3 - cell_size));
+                sq += g3 * g3;
+                if (sq > radius_squared) continue;
+              }
+            }
             const int cell =
                 ((x * parameters->resolution[1] + y) *
                      parameters->resolution[2] +
@@ -757,9 +784,10 @@ void launchGridNeighbors(
     float radius, int max_neighbors, bool exclude_self, bool inputs_are_same,
     const int* query_indices, float* neighbor_distances,
     int* neighbor_indices, cudaStream_t stream) {
-  const int blocks = blocksFor(query_count);
+  const int blocks = static_cast<int>(std::min<std::int64_t>(
+      (query_count + kSearchThreads - 1) / kSearchThreads, 65535));
 #define FRNN_LAUNCH_GRID(Dimension)                                        \
-  findNeighbors<Dimension><<<blocks, kThreads, 0, stream>>>(               \
+  findNeighbors<Dimension><<<blocks, kSearchThreads, 0, stream>>>(         \
       query, query_count, sorted_database, sorted_database_indices,          \
       database_count, dimension, parameters, grid_offsets, radius,           \
       max_neighbors, exclude_self, inputs_are_same, query_indices,           \

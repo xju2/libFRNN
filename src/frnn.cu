@@ -417,6 +417,14 @@ __device__ float squaredDistance(const float* lhs, const float* rhs,
 // SoA variant: sorted_database stored as soa[axis * database_count + idx].
 // Each dimension's values are contiguous: 32 candidates per cache line vs
 // 2.67 for AoS, reducing DRAM pressure on the early-exit filter path.
+//
+// For D a multiple of 4 and > 4: check axes in groups of 4, interleaving the
+// loads so all 4 in a group are issued before any result is used.  The serial
+// load chain (each break-check gates the next load) limits the current approach
+// to ~1 axis per 576-cycle DRAM latency.  With 4-way interleaving, a group of
+// 4 loads completes in ~576 cycles (one DRAM round-trip) instead of 4×576.
+// Group order: unindexed dims (4..D-1) first, grid dims (0..3) last, so most
+// failing candidates are eliminated in group 0 without entering group 1.
 template <int StaticDimension>
 __device__ float squaredDistanceSoA(const float* soa, int idx,
                                     int database_count,
@@ -424,14 +432,54 @@ __device__ float squaredDistanceSoA(const float* soa, int idx,
                                     int runtime_dimension, float limit) {
   const int dimension =
       StaticDimension == 0 ? runtime_dimension : StaticDimension;
+  // kGD: number of grid dimensions. Grid dims are put in the last group.
+  constexpr int kGD =
+      StaticDimension == 0 ? 0
+      : StaticDimension > 4 ? 4
+      : StaticDimension <= 3 ? StaticDimension
+      : 3;
   float distance = 0.0F;
+  if constexpr (StaticDimension != 0 && StaticDimension % 4 == 0) {
+    // 4-way interleaved: D/4 groups, each issuing 4 independent loads.
+    constexpr int kGroups = StaticDimension / 4;
 #pragma unroll
-  for (int axis = 0; axis < dimension; ++axis) {
-    const float difference =
-        soa[axis * database_count + idx] - query_point[axis];
-    distance += difference * difference;
-    if (distance > limit) {
-      break;
+    for (int g = 0; g < kGroups; ++g) {
+      // Axes within this group (compile-time constants after unroll):
+      const int ax0 = (g * 4 + kGD) % StaticDimension;
+      const int ax1 = (g * 4 + kGD + 1) % StaticDimension;
+      const int ax2 = (g * 4 + kGD + 2) % StaticDimension;
+      const int ax3 = (g * 4 + kGD + 3) % StaticDimension;
+      // All 4 loads issued before any computation (no inter-load dependency):
+      const float d0 = soa[ax0 * database_count + idx] - query_point[ax0];
+      const float d1 = soa[ax1 * database_count + idx] - query_point[ax1];
+      const float d2 = soa[ax2 * database_count + idx] - query_point[ax2];
+      const float d3 = soa[ax3 * database_count + idx] - query_point[ax3];
+      distance += d0 * d0 + d1 * d1 + d2 * d2 + d3 * d3;
+      if (distance > limit) {
+        break;
+      }
+    }
+  } else if constexpr (StaticDimension != 0) {
+    // Non-multiple-of-4 compile-time D: reorder axes and check one at a time.
+#pragma unroll
+    for (int a = 0; a < StaticDimension; ++a) {
+      const int axis = (StaticDimension > 4) ? (a + kGD) % StaticDimension : a;
+      const float difference =
+          soa[axis * database_count + idx] - query_point[axis];
+      distance += difference * difference;
+      if (distance > limit) {
+        break;
+      }
+    }
+  } else {
+    // Runtime dimension: 1 axis per iteration with early exit.
+    for (int axis = 0; axis < dimension; ++axis) {
+      const float difference =
+          soa[axis * database_count + idx] - query_point[axis];
+      distance += difference * difference;
+      if (distance > limit) {
+        break;
+      }
     }
   }
   return distance;
@@ -490,7 +538,8 @@ __global__ void findNeighborsBruteForce(
 
 
 template <int StaticDimension>
-__global__ void findNeighbors(
+__global__ __launch_bounds__(kSearchThreads, 8)
+void findNeighbors(
     const float* query, int query_count,
     const float* sorted_database,
     const int* sorted_database_indices, int database_count, int dimension,
@@ -674,11 +723,35 @@ __global__ void findNeighborsWarpCoop(
                 (coordinate - parameters->minimum[axis] + radius) *
                 parameters->inverse_cell_size)));
   }
+  const float cell_size = 1.0f / parameters->inverse_cell_size;
 
   for (int x = minimum_cell[0]; x <= maximum_cell[0]; ++x) {
     for (int y = minimum_cell[1]; y <= maximum_cell[1]; ++y) {
       for (int z = minimum_cell[2]; z <= maximum_cell[2]; ++z) {
         for (int w = minimum_cell[3]; w <= maximum_cell[3]; ++w) {
+          {
+            const float cn0 = parameters->minimum[0] + x * cell_size;
+            const float g0 = fmaxf(0.0f, fmaxf(cn0 - query_point[0],
+                                                 query_point[0] - cn0 - cell_size));
+            float sq = g0 * g0;
+            const float cn1 = parameters->minimum[1] + y * cell_size;
+            const float g1 = fmaxf(0.0f, fmaxf(cn1 - query_point[1],
+                                                 query_point[1] - cn1 - cell_size));
+            sq += g1 * g1;
+            if (sq > radius_squared) continue;
+            const float cn2 = parameters->minimum[2] + z * cell_size;
+            const float g2 = fmaxf(0.0f, fmaxf(cn2 - query_point[2],
+                                                 query_point[2] - cn2 - cell_size));
+            sq += g2 * g2;
+            if (sq > radius_squared) continue;
+            if (parameters->grid_dimensions >= 4) {
+              const float cn3 = parameters->minimum[3] + w * cell_size;
+              const float g3 = fmaxf(0.0f, fmaxf(cn3 - query_point[3],
+                                                   query_point[3] - cn3 - cell_size));
+              sq += g3 * g3;
+              if (sq > radius_squared) continue;
+            }
+          }
           const int cell =
               ((x * parameters->resolution[1] + y) *
                    parameters->resolution[2] +

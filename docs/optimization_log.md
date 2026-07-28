@@ -258,8 +258,8 @@ and 2^-142 absolute, exceeding the roundoff difference bound for at most 32
 non-negative float32 terms. Candidates not safely outside that threshold are
 recomputed with fused multiply-adds in canonical dimension order. This keeps
 neighbor membership and distance ordering identical to the explicit FMA
-oracle while preserving most of the filter benefit. Preliminary warm p50 is
-263.2 ms on the real D=12 workload and 2.21 ms on the 10,000-point D=8 sparse
+oracle while preserving most of the filter benefit. Final warm p50 is
+268.2 ms on the real D=12 workload and 2.22 ms on the 10,000-point D=8 sparse
 case, versus 356.3 ms and 3.23 ms before the SoA/screening work.
 
 An experimental warp-cooperative large-K kernel was compiled but never

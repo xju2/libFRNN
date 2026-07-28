@@ -3,7 +3,7 @@
 ## Scope and revisions
 
 - Baseline implementation: `a35c71322750`
-- Measured optimized implementation: `fc4e73cb48da`
+- Measured optimized implementation: `7618444ffc63`
 - Branch: `improve`
 
 The optimized implementation preserves the standalone C++17/CUDA API and has
@@ -29,10 +29,10 @@ Host timings use `std::chrono::steady_clock` and synchronize before stopping.
 The raw machine-readable results are:
 
 - `benchmarks/results/baseline_a35c713.csv`
-- `benchmarks/results/final_fc4e73c_sm52.csv`
-- `benchmarks/results/final_real_fc4e73c_sm52.csv`
-- `benchmarks/results/final_fc4e73c_sm75.csv`
-- `benchmarks/results/final_real_fc4e73c_sm75.csv`
+- `benchmarks/results/final_7618444_sm52.csv`
+- `benchmarks/results/final_real_7618444_sm52.csv`
+- `benchmarks/results/final_7618444_sm75.csv`
+- `benchmarks/results/final_real_7618444_sm75.csv`
 
 ## Final architecture
 
@@ -85,7 +85,8 @@ count-only calls; default/non-default streams; and concurrent independent
 streams. An additional 4,096-candidate D=8/12/16/32 suite targets rounding
 sensitivity exactly at the radius. Dedicated cases cover grid-cell
 boundaries, tiny and large finite coordinates/cells, highly occupied cells,
-and empty cells between occupied cells.
+empty cells between occupied cells, and automatic dispatch immediately below
+and above its production threshold.
 
 The real reference validation is exact:
 
@@ -97,7 +98,7 @@ The real reference validation is exact:
 | Output directed edges | 9,279,672 |
 | Missing / extra | 0 / 0 |
 | Precision / recall | 1.0 / 1.0 |
-| Repeated host/Python time | 0.576 s |
+| Repeated host/Python time | 0.584 s |
 
 The CUDA core, Python binding suite, and installed CMake consumer all form
 separate validation layers. Compute Sanitizer could not run because this
@@ -110,14 +111,14 @@ Warm device latency:
 
 | Workload | Baseline p50 / p95 | Final p50 / p95 | p50 speedup |
 |---|---:|---:|---:|
-| 128, D=3, K=4, sparse | 0.168 / 0.170 ms | 0.059 / 0.059 ms | 2.87x |
-| 512, D=3, K=32, dense | 1.031 / 1.037 ms | 0.793 / 0.811 ms | 1.30x |
-| 4,096, D=3, K=16, sparse | 0.454 / 0.459 ms | 0.239 / 0.244 ms | 1.89x |
-| 10,000, D=8, K=16, sparse | 8.240 / 8.252 ms | 2.213 / 2.235 ms | 3.72x |
-| 10,000 separate, D=4, K=32 | 2.733 / 2.754 ms | 2.881 / 2.900 ms | 0.95x |
+| 128, D=3, K=4, sparse | 0.168 / 0.170 ms | 0.058 / 0.059 ms | 2.89x |
+| 512, D=3, K=32, dense | 1.031 / 1.037 ms | 0.788 / 0.810 ms | 1.31x |
+| 4,096, D=3, K=16, sparse | 0.454 / 0.459 ms | 0.242 / 0.246 ms | 1.87x |
+| 10,000, D=8, K=16, sparse | 8.240 / 8.252 ms | 2.224 / 2.255 ms | 3.70x |
+| 10,000 separate, D=4, K=32 | 2.733 / 2.754 ms | 2.887 / 2.911 ms | 0.95x |
 
 The p50 geometric-mean speedup over these five immutable-baseline cases is
-1.90x. The only primary-case regression is 5.4%, below the 10% acceptance
+1.90x. The only primary-case regression is 5.6%, below the 10% acceptance
 limit. Architecture-75 results are effectively identical on these cases and
 are retained separately rather than mixed into the baseline comparison.
 
@@ -125,29 +126,29 @@ Host convenience API latency:
 
 | Workload | Baseline p50 | Final p50 | Speedup |
 |---|---:|---:|---:|
-| 128, D=3, K=4 | 0.706 ms | 0.118 ms | 5.99x |
-| 512, D=3, K=32 | 1.604 ms | 1.038 ms | 1.55x |
-| 4,096, D=3, K=16 | 1.372 ms | 0.554 ms | 2.48x |
-| 10,000, D=8, K=16 | 9.520 ms | 3.272 ms | 2.91x |
-| 10,000 separate, D=4, K=32 | 5.109 ms | 4.328 ms | 1.18x |
+| 128, D=3, K=4 | 0.706 ms | 0.116 ms | 6.08x |
+| 512, D=3, K=32 | 1.604 ms | 1.065 ms | 1.51x |
+| 4,096, D=3, K=16 | 1.372 ms | 0.555 ms | 2.47x |
+| 10,000, D=8, K=16 | 9.520 ms | 3.248 ms | 2.93x |
+| 10,000 separate, D=4, K=32 | 5.109 ms | 4.312 ms | 1.18x |
 
 Real device breakdown:
 
 | Phase | p50 | p95 |
 |---|---:|---:|
-| One-time workspace reserve | 45.260 ms | 47.051 ms |
-| Cold device call | 308.930 ms | 311.633 ms |
-| Warm device GPU | 263.300 ms | 265.539 ms |
-| Grid bounds | 0.129 ms | 0.156 ms |
+| One-time workspace reserve | 45.243 ms | 46.026 ms |
+| Cold device call | 314.828 ms | 316.496 ms |
+| Warm device GPU | 268.216 ms | 270.607 ms |
+| Grid bounds | 0.119 ms | 0.151 ms |
 | Cell assignment | 0.069 ms | 0.070 ms |
-| Dense-grid scan | 0.047 ms | 0.049 ms |
-| SoA point reorder | 0.526 ms | 0.535 ms |
-| Neighbor search | 259.343 ms | 261.822 ms |
-| Edge count / scan / write | 3.234 ms | 3.302 ms |
-| Warm synchronized host | 263.708 ms | 265.177 ms |
-| 9.28M-edge device-to-host copy | 6.987 ms | 7.323 ms |
+| Dense-grid scan | 0.047 ms | 0.048 ms |
+| SoA point reorder | 0.524 ms | 0.540 ms |
+| Neighbor search | 264.086 ms | 266.577 ms |
+| Edge count / scan / write | 3.238 ms | 3.286 ms |
+| Warm synchronized host | 268.611 ms | 271.051 ms |
+| 9.28M-edge device-to-host copy | 7.107 ms | 7.757 ms |
 
-The real warm device path is 1.35x faster than the previous 356.277 ms
+The real warm device path is 1.33x faster than the previous 356.277 ms
 result. Neighbor search is now 98.5% of measured device latency; grid
 construction and edge post-processing are no longer credible primary
 bottlenecks.
@@ -180,8 +181,8 @@ For the real host call, major device allocations are approximately:
 Count-first host allocation avoids the 4,146 MiB conservative edge output
 that would otherwise be required for N×K capacity.
 
-The architecture-52 Release shared library grows from 168 KiB to 573 KiB
-(3.41x); the architecture-75 build is 645 KiB. A clean parallel build on this
+The architecture-52 Release shared library grows from 168 KiB to 589 KiB
+(3.51x); the architecture-75 build is 669 KiB. A clean parallel build on this
 machine grows from 4.01 seconds to 9.47 seconds (2.36x). The additional code
 comes mainly from common-dimension kernels specialized for identical versus
 separate inputs and from the exact heap path. Resource inspection reports 64
@@ -189,10 +190,13 @@ registers and no stack for the retained identical D=8/D=12 kernels; identical
 D=16 uses 64 registers and 128 bytes of stack.
 
 No immutable primary benchmark regresses by 10%. Relative to the previous
-broad optimized matrix, no case regresses by 10% either: the largest increases
-are 6.7% for 500,000/D=3 and 4.7% for separate D=4. D=8 and D=12 cases improve
-by 18–32%, including the formerly regressed duplicate distribution, which
-drops from 2.364 ms to 1.690 ms.
+broad optimized matrix, the cell-boundary stress case rises from 0.257 ms to
+0.291 ms (+13.2%) because conservative query-range expansion deliberately
+visits an adjacent cell at roundoff-sensitive boundaries. This non-primary
+edge-case regression is retained for the exactness guarantee. The next-largest
+increases are 6.8% for 500,000/D=3 and 5.0% for separate D=4. D=8 and D=12
+cases improve by 18–32%, including the formerly regressed duplicate
+distribution.
 
 ## Retained and rejected experiments
 
@@ -320,5 +324,5 @@ Expands differential testing to all dispatch paths and adds reproducible
 synthetic/real benchmarks. The supplied 271,663×12 dataset matches all
 9,279,672 reference edges exactly. Representative warm GPU p50 improves by
 1.90x geometric mean, including 2.87x on small sparse and 3.72x on medium D=8
-workloads; the real device path improves from 356.3 ms to 263.3 ms.
+workloads; the real device path improves from 356.3 ms to 268.2 ms.
 ```

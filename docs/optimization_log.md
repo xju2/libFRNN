@@ -204,11 +204,59 @@ K=1000 workload, warm device p50 improves from 370.8 ms with insertion to
 357.7 ms with the 24-candidate hybrid. Thresholds of 32 and an always-heap
 variant are retained in machine-readable experiment results for comparison.
 
+### Structure-of-arrays database reorder — retained
+
+Hypothesis: candidate threads read the same coordinate axis at adjacent sorted
+indices, so a structure-of-arrays layout should coalesce distance-filter loads
+better than the original array-of-structures layout.
+
+The counting-sort output now stores every coordinate axis contiguously while
+retaining original point indices separately. The query input and public API
+remain array-of-structures. This reduced real D=12 neighbor-search time from
+about 394 ms to 336 ms in the initial experiment. The retained layout also
+made later independent-load scheduling possible.
+
+### Four-dimensional cell AABB filter and 128-thread search blocks — retained
+
+Hypothesis: the radius-aligned nested cell range contains corner cells whose
+minimum Euclidean distance already exceeds the radius, and the high-register
+search kernel does not benefit from 256-thread blocks.
+
+The grid traversal now rejects such cells with a four-dimensional
+axis-aligned-box distance test before loading their points, and the search
+kernel uses 128 threads with an occupancy launch bound. The real workload
+improved from about 336 ms to 311 ms. Differential cases spanning boundary,
+empty-cell, and randomized layouts retained exact output.
+
+### Reordered grouped distance screening — narrowed for exactness
+
+The first experiment accumulated dimensions 4..D-1 before the four indexed
+grid dimensions and grouped four squared terms into each addition. It reduced
+the real warm device time to roughly 256 ms, but changed float32 evaluation
+order. A new adversarial suite that normalizes 4,096 D=8/12/16/32 candidates
+onto the radius boundary exposed an edge-set mismatch, so that direct
+reordered result was rejected.
+
+The retained design uses reordered four-load groups only as a conservative
+screen. Its rejection threshold expands `radius_squared` by 2^-16 relative
+and 2^-142 absolute, exceeding the roundoff difference bound for at most 32
+non-negative float32 terms. Candidates not safely outside that threshold are
+recomputed with fused multiply-adds in canonical dimension order. This keeps
+neighbor membership and distance ordering identical to the explicit FMA
+oracle while preserving most of the filter benefit. Preliminary warm p50 is
+263.2 ms on the real D=12 workload and 2.21 ms on the 10,000-point D=8 sparse
+case, versus 356.3 ms and 3.23 ms before the SoA/screening work.
+
+An experimental warp-cooperative large-K kernel was compiled but never
+dispatched and had no validated performance result. It was removed rather
+than retained as an abandoned alternate path.
+
 ## Correctness evidence
 
-The independent CPU oracle computes every dimension with `float`
-accumulation, includes `distance <= radius * radius`, sorts by `(distance,
-original index)`, truncates to K, and then applies edge post-processing.
+The independent CPU oracle computes every dimension with an explicit
+float32 fused multiply-add in axis order, includes
+`distance <= radius * radius`, sorts by `(distance, original index)`,
+truncates to K, and then applies edge post-processing.
 
 The C++ differential suite currently covers 2,500 randomized cases and all
 three dispatch choices, producing 7,500 forced/automatic comparisons per

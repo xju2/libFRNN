@@ -15,7 +15,8 @@ every input dimension.
 
 Both production search paths implement the same canonical result:
 
-1. accumulate squared Euclidean distance in `float32` dimension order;
+1. accumulate squared Euclidean distance in `float32` dimension order with
+   one fused multiply-add per coordinate;
 2. include candidates whose squared distance is less than or equal to
    `radius * radius`;
 3. order each query row by `(squared_distance, original_database_index)`;
@@ -25,9 +26,10 @@ Both production search paths implement the same canonical result:
 Neighbor indices and final edges are exact, not recall-based. Duplicate
 coordinates retain distinct original indices, radius boundaries are
 inclusive, and equal-distance ties prefer the lower original index. Internal
-squared distances are not part of the public output. The test oracle uses the
-same `float32` accumulation contract and includes exact-boundary and adjacent
-`nextafter` cases.
+squared distances are not part of the public output. The independent CPU
+oracle uses `std::fma` to make the same accumulation contract explicit and
+includes exact-boundary, adjacent `nextafter`, and rounding-sensitive
+high-dimensional cases.
 
 The grid path builds bounds, assigns database points to dense cells, performs
 a prefix sum and counting sort, and searches only cells intersecting each

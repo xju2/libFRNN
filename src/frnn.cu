@@ -255,8 +255,8 @@ __global__ void insertPoints(const float* points, int point_count,
   }
 }
 
-// sorted_points uses SoA layout: sorted_points[axis * point_count + dest].
-// All dimension axes are stored so squaredDistanceSoA can check all dims.
+// Higher dimensions use SoA for coalesced axis screening. Dimensions through
+// four retain AoS because each candidate fits in one short contiguous record.
 __global__ void countingSort(const float* points, int point_count,
                              int dimension,
                              const int* point_cells,
@@ -268,8 +268,10 @@ __global__ void countingSort(const float* points, int point_count,
     const int destination =
         grid_offsets[point_cells[point]] + point_cell_indices[point];
     for (int axis = 0; axis < dimension; ++axis) {
-      sorted_points[axis * point_count + destination] =
-          points[point * dimension + axis];
+      const int sorted_offset =
+          dimension <= 4 ? destination * dimension + axis
+                         : axis * point_count + destination;
+      sorted_points[sorted_offset] = points[point * dimension + axis];
     }
     sorted_indices[destination] = point;
   }
@@ -558,14 +560,14 @@ __global__ void findNeighborsBruteForce(
 }
 
 
-template <int StaticDimension>
-__global__ __launch_bounds__(kSearchThreads, 8)
+template <int StaticDimension, int SearchThreads, bool InputsAreSame>
+__global__ __launch_bounds__(SearchThreads, SearchThreads == 128 ? 8 : 4)
 void findNeighbors(
-    const float* query, int query_count,
+    const float* query, int query_count, const float* database,
     const float* sorted_database,
     const int* sorted_database_indices, int database_count, int dimension,
     const GridParameters* parameters, const int* grid_offsets,
-    float radius, int max_neighbors, bool exclude_self, bool inputs_are_same,
+    float radius, int max_neighbors, bool exclude_self,
     const int* query_indices, float* neighbor_distances,
     int* neighbor_indices) {
   const float radius_squared = radius * radius;
@@ -615,9 +617,10 @@ void findNeighbors(
       for (int y = minimum_cell[1]; y <= maximum_cell[1]; ++y) {
         for (int z = minimum_cell[2]; z <= maximum_cell[2]; ++z) {
           for (int w = minimum_cell[3]; w <= maximum_cell[3]; ++w) {
-            // Skip cell if its minimum 4D distance to the query already
-            // exceeds the search radius (no candidate in the cell can pass).
-            {
+            // Four-dimensional grids visit many corner cells whose bounding
+            // boxes cannot intersect the radius. The same check is not worth
+            // its arithmetic cost for the smaller three-dimensional stencil.
+            if (parameters->grid_dimensions >= 4) {
               const float cn0 = parameters->minimum[0] + x * cell_size;
               const float g0 = fmaxf(0.0f, fmaxf(cn0 - query_point[0],
                                                    query_point[0] - cn0 - cell_size));
@@ -632,13 +635,11 @@ void findNeighbors(
                                                    query_point[2] - cn2 - cell_size));
               sq += g2 * g2;
               if (sq > radius_squared) continue;
-              if (parameters->grid_dimensions >= 4) {
-                const float cn3 = parameters->minimum[3] + w * cell_size;
-                const float g3 = fmaxf(0.0f, fmaxf(cn3 - query_point[3],
-                                                     query_point[3] - cn3 - cell_size));
-                sq += g3 * g3;
-                if (sq > radius_squared) continue;
-              }
+              const float cn3 = parameters->minimum[3] + w * cell_size;
+              const float g3 = fmaxf(0.0f, fmaxf(cn3 - query_point[3],
+                                                   query_point[3] - cn3 - cell_size));
+              sq += g3 * g3;
+              if (sq > radius_squared) continue;
             }
             const int cell =
                 ((x * parameters->resolution[1] + y) *
@@ -655,13 +656,25 @@ void findNeighbors(
                  ++sorted_index) {
               const int database_index =
                   sorted_database_indices[sorted_index];
-              if (exclude_self && inputs_are_same &&
+              if (exclude_self && InputsAreSame &&
                   database_index == query_index) {
                 continue;
               }
-              const float distance = squaredDistanceSoA<StaticDimension>(
-                  sorted_database, sorted_index, database_count, query_point,
-                  dimension, radius_squared);
+              float distance = 0.0F;
+              if constexpr (InputsAreSame &&
+                            (StaticDimension == 0 || StaticDimension > 4)) {
+                distance = squaredDistanceSoA<StaticDimension>(
+                    sorted_database, sorted_index, database_count, query_point,
+                    dimension, radius_squared);
+              } else {
+                const float* candidate = InputsAreSame
+                                             ? sorted_database +
+                                                   sorted_index * dimension
+                                             : database +
+                                                   database_index * dimension;
+                distance = squaredDistance<StaticDimension>(
+                    candidate, query_point, dimension, radius_squared);
+              }
               if (distance > radius_squared) {
                 continue;
               }
@@ -723,44 +736,80 @@ void launchBruteForceNeighbors(
 }
 
 void launchGridNeighbors(
-    const float* query, int query_count, const float* sorted_database,
+    const float* query, int query_count, const float* database,
+    const float* sorted_database,
     const int* sorted_database_indices, int database_count, int dimension,
     const GridParameters* parameters, const int* grid_offsets,
     float radius, int max_neighbors, bool exclude_self, bool inputs_are_same,
     const int* query_indices, float* neighbor_distances,
     int* neighbor_indices, cudaStream_t stream) {
+  const int search_threads = dimension <= 4 ? kThreads : kSearchThreads;
   const int blocks = static_cast<int>(std::min<std::int64_t>(
-      (query_count + kSearchThreads - 1) / kSearchThreads, 65535));
-#define FRNN_LAUNCH_GRID(Dimension)                                        \
-  findNeighbors<Dimension><<<blocks, kSearchThreads, 0, stream>>>(         \
-      query, query_count, sorted_database, sorted_database_indices,          \
+      (query_count + search_threads - 1) / search_threads, 65535));
+#define FRNN_LAUNCH_GRID(Dimension, SearchThreads, InputsAreSame)           \
+  findNeighbors<Dimension, SearchThreads, InputsAreSame>                    \
+      <<<blocks, SearchThreads, 0, stream>>>(                              \
+      query, query_count, database, sorted_database,                         \
+      sorted_database_indices,                                               \
       database_count, dimension, parameters, grid_offsets, radius,           \
-      max_neighbors, exclude_self, inputs_are_same, query_indices,           \
+      max_neighbors, exclude_self, query_indices,                            \
       neighbor_distances, neighbor_indices)
   switch (dimension) {
     case 1:
-      FRNN_LAUNCH_GRID(1);
+      if (inputs_are_same) {
+        FRNN_LAUNCH_GRID(1, kThreads, true);
+      } else {
+        FRNN_LAUNCH_GRID(1, kThreads, false);
+      }
       break;
     case 2:
-      FRNN_LAUNCH_GRID(2);
+      if (inputs_are_same) {
+        FRNN_LAUNCH_GRID(2, kThreads, true);
+      } else {
+        FRNN_LAUNCH_GRID(2, kThreads, false);
+      }
       break;
     case 3:
-      FRNN_LAUNCH_GRID(3);
+      if (inputs_are_same) {
+        FRNN_LAUNCH_GRID(3, kThreads, true);
+      } else {
+        FRNN_LAUNCH_GRID(3, kThreads, false);
+      }
       break;
     case 4:
-      FRNN_LAUNCH_GRID(4);
+      if (inputs_are_same) {
+        FRNN_LAUNCH_GRID(4, kThreads, true);
+      } else {
+        FRNN_LAUNCH_GRID(4, kThreads, false);
+      }
       break;
     case 8:
-      FRNN_LAUNCH_GRID(8);
+      if (inputs_are_same) {
+        FRNN_LAUNCH_GRID(8, kSearchThreads, true);
+      } else {
+        FRNN_LAUNCH_GRID(8, kSearchThreads, false);
+      }
       break;
     case 12:
-      FRNN_LAUNCH_GRID(12);
+      if (inputs_are_same) {
+        FRNN_LAUNCH_GRID(12, kSearchThreads, true);
+      } else {
+        FRNN_LAUNCH_GRID(12, kSearchThreads, false);
+      }
       break;
     case 16:
-      FRNN_LAUNCH_GRID(16);
+      if (inputs_are_same) {
+        FRNN_LAUNCH_GRID(16, kSearchThreads, true);
+      } else {
+        FRNN_LAUNCH_GRID(16, kSearchThreads, false);
+      }
       break;
     default:
-      FRNN_LAUNCH_GRID(0);
+      if (inputs_are_same) {
+        FRNN_LAUNCH_GRID(0, kSearchThreads, true);
+      } else {
+        FRNN_LAUNCH_GRID(0, kSearchThreads, false);
+      }
       break;
   }
 #undef FRNN_LAUNCH_GRID
@@ -1156,7 +1205,7 @@ void buildEdgesAsync(DevicePointView query, DevicePointView database,
     const int* search_query_indices =
         options.inputs_are_same ? memory.sorted_database_indices : nullptr;
     launchGridNeighbors(
-        search_query, query_count, memory.sorted_database,
+        search_query, query_count, database.data, memory.sorted_database,
         memory.sorted_database_indices, database_count, query.dimension,
         memory.grid_parameters, memory.grid_offsets,
         radius, max_neighbors,

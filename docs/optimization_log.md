@@ -210,11 +210,22 @@ Hypothesis: candidate threads read the same coordinate axis at adjacent sorted
 indices, so a structure-of-arrays layout should coalesce distance-filter loads
 better than the original array-of-structures layout.
 
-The counting-sort output now stores every coordinate axis contiguously while
-retaining original point indices separately. The query input and public API
-remain array-of-structures. This reduced real D=12 neighbor-search time from
-about 394 ms to 336 ms in the initial experiment. The retained layout also
-made later independent-load scheduling possible.
+For dimensions above four, the counting-sort output now stores every
+coordinate axis contiguously while retaining original point indices
+separately. This reduced real D=12 neighbor-search time from about 394 ms to
+336 ms in the initial experiment and made later independent-load scheduling
+possible.
+
+The first version applied SoA and 128-thread blocks unconditionally. The full
+matrix then exposed regressions of 20.7% for separate D=4 queries and 14.9%
+for the 500,000-point D=3 case. The retained layout is workload-sensitive:
+dimensions through four keep sorted AoS records and use 256-thread blocks;
+higher dimensions use SoA and 128 threads. Separate query/reference kernels
+read original AoS database records because unrelated query cells do not
+coalesce sorted SoA loads. Identical and separate modes are compile-time
+kernel specializations to avoid carrying both paths in registers. The
+affected warm p50 values recovered to 3.53 ms for 500,000/D=3 and 2.88 ms for
+separate D=4, within 7% and 5% of the prior optimized matrix respectively.
 
 ### Four-dimensional cell AABB filter and 128-thread search blocks — retained
 
@@ -222,11 +233,13 @@ Hypothesis: the radius-aligned nested cell range contains corner cells whose
 minimum Euclidean distance already exceeds the radius, and the high-register
 search kernel does not benefit from 256-thread blocks.
 
-The grid traversal now rejects such cells with a four-dimensional
-axis-aligned-box distance test before loading their points, and the search
-kernel uses 128 threads with an occupancy launch bound. The real workload
-improved from about 336 ms to 311 ms. Differential cases spanning boundary,
-empty-cell, and randomized layouts retained exact output.
+Four-dimensional grid traversal now rejects such cells with an
+axis-aligned-box distance test before loading their points, and the
+high-dimensional search kernel uses 128 threads with an occupancy launch
+bound. Applying that arithmetic to three-dimensional grids was not beneficial
+and is disabled. The real workload improved from about 336 ms to 311 ms.
+Differential cases spanning boundary, empty-cell, and randomized layouts
+retained exact output.
 
 ### Reordered grouped distance screening — narrowed for exactness
 

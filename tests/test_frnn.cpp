@@ -321,6 +321,37 @@ void testAllDispatchPaths() {
   }
 }
 
+void testAutomaticDispatchThreshold() {
+  constexpr std::int64_t query_count = 64;
+  constexpr std::int64_t lower_database_count = 10416;
+  constexpr std::int64_t upper_database_count = 10417;
+  constexpr int dimension = 3;
+  constexpr int max_neighbors = 8;
+  std::vector<float> query(query_count * dimension);
+  std::vector<float> database(upper_database_count * dimension);
+  for (std::int64_t point = 0; point < query_count; ++point) {
+    query[point * dimension] = static_cast<float>(point) * 0.01F;
+    query[point * dimension + 1] =
+        static_cast<float>(point % 7) * 0.002F;
+    query[point * dimension + 2] = 0.0F;
+  }
+  for (std::int64_t point = 0; point < upper_database_count; ++point) {
+    database[point * dimension] = static_cast<float>(point) * 0.001F;
+    database[point * dimension + 1] =
+        static_cast<float>(point % 11) * 0.002F;
+    database[point * dimension + 2] = 0.0F;
+  }
+
+  frnn::BuildOptions options;
+  options.algorithm = frnn::SearchAlgorithm::automatic;
+  requireAgreement(query, query_count, database, lower_database_count,
+                   dimension, 0.015F, max_neighbors, options,
+                   "automatic dispatch immediately below threshold");
+  requireAgreement(query, query_count, database, upper_database_count,
+                   dimension, 0.015F, max_neighbors, options,
+                   "automatic dispatch immediately above threshold");
+}
+
 void testRandomizedDifferential() {
   constexpr int dimensions[] = {1, 2, 3, 4, 8, 16, 32};
   constexpr int neighbor_counts[] = {0, 1, 4, 8, 16, 32, 64};
@@ -617,6 +648,7 @@ int main() {
     testGridPathologicalGeometry();
     testEmptyAndInvalidInput();
     testAllDispatchPaths();
+    testAutomaticDispatchThreshold();
     testRandomizedDifferential();
     testCompatibilityLayout();
     testCallerStreamDeviceApi();

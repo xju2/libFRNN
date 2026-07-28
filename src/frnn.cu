@@ -26,6 +26,9 @@ constexpr int kMaximumGridCells4D = 128 * 128 * 128;
 constexpr int kThreads = 256;
 constexpr int kSearchThreads = 128;
 constexpr std::int64_t kBruteForceCoordinateWork = 2'000'000;
+constexpr float kConservativeExpansion = 0x1.0001p0F;
+constexpr float kConservativeAbsoluteMargin = 0x1p-142F;
+constexpr float kCoordinateErrorScale = 0x1p-16F;
 
 struct GridParameters {
   float minimum[kGridDimensions];
@@ -144,6 +147,32 @@ __device__ float atomicMaximum(float* address, float value) {
     }
   }
   return __int_as_float(old);
+}
+
+__device__ __forceinline__ float expandedSquaredLimit(float limit) {
+  return fmaf(limit, kConservativeExpansion,
+              kConservativeAbsoluteMargin);
+}
+
+__device__ __forceinline__ float cellRangeError(
+    float coordinate_delta, float radius, float inverse_cell_size) {
+  return fmaf((fabsf(coordinate_delta) + radius) *
+                  fabsf(inverse_cell_size),
+              kCoordinateErrorScale, kCoordinateErrorScale);
+}
+
+__device__ __forceinline__ float minimumCellGap(
+    float query_coordinate, float grid_minimum, int cell_coordinate,
+    float cell_size) {
+  const float offset = static_cast<float>(cell_coordinate) * cell_size;
+  const float lower = grid_minimum + offset;
+  const float padding =
+      fmaf(fabsf(grid_minimum) + fabsf(offset) + fabsf(cell_size),
+           kCoordinateErrorScale, kConservativeAbsoluteMargin);
+  const float upper = lower + cell_size;
+  return fmaxf(0.0F,
+               fmaxf(lower - padding - query_coordinate,
+                     query_coordinate - upper - padding));
 }
 
 __global__ void initializeBounds(float* bounds) {
@@ -434,10 +463,7 @@ __device__ float squaredDistanceSoA(const float* soa, int idx,
   const int dimension =
       StaticDimension == 0 ? runtime_dimension : StaticDimension;
   if constexpr (StaticDimension > 4) {
-    constexpr float kScreenExpansion = 0x1.0001p0F;
-    constexpr float kScreenAbsoluteMargin = 0x1p-142F;
-    const float screen_limit =
-        fmaf(limit, kScreenExpansion, kScreenAbsoluteMargin);
+    const float screen_limit = expandedSquaredLimit(limit);
     float screen_distance = 0.0F;
     constexpr int kGroups = StaticDimension / 4;
 #pragma unroll
@@ -601,18 +627,26 @@ void findNeighbors(
     int maximum_cell[kGridDimensions] = {0, 0, 0, 0};
     for (int axis = 0; axis < parameters->grid_dimensions; ++axis) {
       const float coordinate = query_point[axis];
+      const float coordinate_delta =
+          coordinate - parameters->minimum[axis];
+      const float range_error =
+          cellRangeError(coordinate_delta, radius,
+                         parameters->inverse_cell_size);
       minimum_cell[axis] = max(
           0, static_cast<int>(floorf(
-                 (coordinate - parameters->minimum[axis] - radius) *
-                 parameters->inverse_cell_size)));
+                 (coordinate_delta - radius) *
+                     parameters->inverse_cell_size -
+                 range_error)));
       maximum_cell[axis] =
           min(parameters->resolution[axis] - 1,
               static_cast<int>(floorf(
-                  (coordinate - parameters->minimum[axis] + radius) *
-                  parameters->inverse_cell_size)));
+                  (coordinate_delta + radius) *
+                      parameters->inverse_cell_size +
+                  range_error)));
     }
 
     const float cell_size = 1.0f / parameters->inverse_cell_size;
+    const float cell_limit = expandedSquaredLimit(radius_squared);
     for (int x = minimum_cell[0]; x <= maximum_cell[0]; ++x) {
       for (int y = minimum_cell[1]; y <= maximum_cell[1]; ++y) {
         for (int z = minimum_cell[2]; z <= maximum_cell[2]; ++z) {
@@ -621,25 +655,21 @@ void findNeighbors(
             // boxes cannot intersect the radius. The same check is not worth
             // its arithmetic cost for the smaller three-dimensional stencil.
             if (parameters->grid_dimensions >= 4) {
-              const float cn0 = parameters->minimum[0] + x * cell_size;
-              const float g0 = fmaxf(0.0f, fmaxf(cn0 - query_point[0],
-                                                   query_point[0] - cn0 - cell_size));
+              const float g0 = minimumCellGap(
+                  query_point[0], parameters->minimum[0], x, cell_size);
               float sq = g0 * g0;
-              const float cn1 = parameters->minimum[1] + y * cell_size;
-              const float g1 = fmaxf(0.0f, fmaxf(cn1 - query_point[1],
-                                                   query_point[1] - cn1 - cell_size));
+              const float g1 = minimumCellGap(
+                  query_point[1], parameters->minimum[1], y, cell_size);
               sq += g1 * g1;
-              if (sq > radius_squared) continue;
-              const float cn2 = parameters->minimum[2] + z * cell_size;
-              const float g2 = fmaxf(0.0f, fmaxf(cn2 - query_point[2],
-                                                   query_point[2] - cn2 - cell_size));
+              if (sq > cell_limit) continue;
+              const float g2 = minimumCellGap(
+                  query_point[2], parameters->minimum[2], z, cell_size);
               sq += g2 * g2;
-              if (sq > radius_squared) continue;
-              const float cn3 = parameters->minimum[3] + w * cell_size;
-              const float g3 = fmaxf(0.0f, fmaxf(cn3 - query_point[3],
-                                                   query_point[3] - cn3 - cell_size));
+              if (sq > cell_limit) continue;
+              const float g3 = minimumCellGap(
+                  query_point[3], parameters->minimum[3], w, cell_size);
               sq += g3 * g3;
-              if (sq > radius_squared) continue;
+              if (sq > cell_limit) continue;
             }
             const int cell =
                 ((x * parameters->resolution[1] + y) *

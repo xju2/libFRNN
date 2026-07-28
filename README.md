@@ -37,7 +37,9 @@ query radius. Sorted coordinates use AoS through dimension 4 and SoA above
 dimension 4; separate query/reference calls read the original AoS database.
 Identical query/reference calls process queries in the existing spatial
 ordering and write results back by original index. Four-dimensional grids
-reject corner cells whose bounding boxes cannot intersect the radius.
+reject corner cells whose bounding boxes cannot intersect the radius. Query
+cell ranges, cell boxes, and rejection thresholds are conservatively expanded
+for float32 roundoff.
 Specialized distance kernels cover dimensions 1, 2, 3, 4, 8, 12, and 16,
 with a generic exact path through dimension 32.
 

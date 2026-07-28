@@ -238,8 +238,10 @@ axis-aligned-box distance test before loading their points, and the
 high-dimensional search kernel uses 128 threads with an occupancy launch
 bound. Applying that arithmetic to three-dimensional grids was not beneficial
 and is disabled. The real workload improved from about 336 ms to 311 ms.
-Differential cases spanning boundary, empty-cell, and randomized layouts
-retained exact output.
+Query cell ranges, reconstructed cell boxes, and the squared-radius rejection
+threshold use explicit conservative roundoff margins. Differential cases
+spanning boundary, empty-cell, tiny/large-cell, and randomized layouts retain
+exact output.
 
 ### Reordered grouped distance screening — narrowed for exactness
 
@@ -277,7 +279,8 @@ run. It varies dimensions 1, 2, 3, 4, 8, 16, and 32; K; radii; identical and
 separate inputs; directed and undirected output; empty neighborhoods; dense
 neighborhoods; duplicates; correlated, sorted, clustered, and degenerate
 coordinates. Dedicated cases cover exact radius boundaries, `nextafter`
-inside/outside values, ties, repeated calls, and a caller-provided stream.
+inside/outside values, ties, repeated calls, concurrent caller streams, and
+the automatic dispatch cases immediately below and above its work threshold.
 
 The supplied real workload (`271,663 x 12`, radius 0.12, K=1000) exactly
 matches all 9,279,672 directed edges in `data/edge_list.csv`: zero missing,

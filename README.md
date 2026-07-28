@@ -33,11 +33,19 @@ high-dimensional cases.
 
 The grid path builds bounds, assigns database points to dense cells, performs
 a prefix sum and counting sort, and searches only cells intersecting each
-query radius. Identical query/reference calls process queries in the existing
-spatial ordering and write results back by original index. Specialized
-distance kernels cover dimensions 1, 2, 3, 4, 8, 12, and 16, with a generic
-exact path through dimension 32. Distance evaluation exits when its
-non-negative partial sum already exceeds the radius.
+query radius. Sorted coordinates use AoS through dimension 4 and SoA above
+dimension 4; separate query/reference calls read the original AoS database.
+Identical query/reference calls process queries in the existing spatial
+ordering and write results back by original index. Four-dimensional grids
+reject corner cells whose bounding boxes cannot intersect the radius.
+Specialized distance kernels cover dimensions 1, 2, 3, 4, 8, 12, and 16,
+with a generic exact path through dimension 32.
+
+High-dimensional kernels first use grouped SoA loads as a conservative
+reordered screen. Candidates close enough to matter are recomputed in
+canonical dimension order, so the screen cannot change membership or
+ordering. Low-dimensional search uses 256-thread blocks; high-dimensional
+search uses 128 threads.
 
 For large K, selection begins as a sorted insertion list and converts to a
 deterministic max-heap only after a query accepts 24 candidates. This avoids

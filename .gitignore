@@ -31,10 +31,12 @@
 *.out
 *.app
 
-build-*
+build-*/
+build_*/
 build/
 *.pyc*
 .venv*/
 dist/
 install/
 install-*/
+data/

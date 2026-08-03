@@ -6,7 +6,7 @@ import unittest
 
 import numpy as np
 
-import frnn
+import frnn_cuda
 
 
 def reference_edges(
@@ -52,7 +52,7 @@ class PythonBindingTests(unittest.TestCase):
                 sys.executable,
                 "-I",
                 "-c",
-                "import sys, frnn; assert 'torch' not in sys.modules",
+                "import sys, frnn_cuda; assert 'torch' not in sys.modules",
             ],
             check=False,
             text=True,
@@ -62,7 +62,7 @@ class PythonBindingTests(unittest.TestCase):
 
     def test_random_cloud_matches_reference(self):
         points = np.random.default_rng(7).random((32, 3), dtype=np.float32)
-        actual = frnn.build_edges(points, radius=0.35, max_neighbors=7)
+        actual = frnn_cuda.build_edges(points, radius=0.35, max_neighbors=7)
         expected = reference_edges(
             points, radius=0.35, max_neighbors=7
         )
@@ -71,7 +71,7 @@ class PythonBindingTests(unittest.TestCase):
     def test_directed_query_database(self):
         query = np.asarray([[0, 0], [1, 0]], dtype=np.float32)
         database = np.asarray([[0, 0], [0.5, 0]], dtype=np.float32)
-        actual = frnn.build_edges(
+        actual = frnn_cuda.build_edges(
             query, database, radius=0.5, max_neighbors=2
         )
         expected = reference_edges(
@@ -82,27 +82,27 @@ class PythonBindingTests(unittest.TestCase):
     def test_empty_input(self):
         points = np.empty((0, 3), dtype=np.float32)
         self.assert_edges_equal(
-            frnn.build_edges(points, radius=1.0, max_neighbors=4),
+            frnn_cuda.build_edges(points, radius=1.0, max_neighbors=4),
             np.empty((2, 0), dtype=np.int64),
         )
 
     def test_single_point(self):
         points = np.zeros((1, 3), dtype=np.float32)
         self.assertEqual(
-            frnn.build_edges(points, radius=1.0, max_neighbors=4).shape,
+            frnn_cuda.build_edges(points, radius=1.0, max_neighbors=4).shape,
             (2, 0),
         )
 
     def test_duplicated_points_and_self_loop_rule(self):
         points = np.zeros((3, 3), dtype=np.float32)
-        actual = frnn.build_edges(points, radius=0.1, max_neighbors=3)
+        actual = frnn_cuda.build_edges(points, radius=0.1, max_neighbors=3)
         expected = np.asarray([[1, 2, 2], [0, 0, 1]], dtype=np.int64)
         self.assert_edges_equal(actual, expected)
 
     def test_radius_boundary_is_inclusive(self):
         points = np.asarray([[0, 0, 0], [1, 0, 0]], dtype=np.float32)
         self.assert_edges_equal(
-            frnn.build_edges(points, radius=1.0, max_neighbors=1),
+            frnn_cuda.build_edges(points, radius=1.0, max_neighbors=1),
             np.asarray([[1], [0]], dtype=np.int64),
         )
 
@@ -111,7 +111,7 @@ class PythonBindingTests(unittest.TestCase):
             [[0, 0], [1, 0], [-1, 0], [0, 1], [0, -1]],
             dtype=np.float32,
         )
-        actual = frnn.build_edges(
+        actual = frnn_cuda.build_edges(
             points, radius=1.0, max_neighbors=1, directed=True
         )
         expected = reference_edges(
@@ -123,7 +123,7 @@ class PythonBindingTests(unittest.TestCase):
         self.assert_edges_equal(actual, expected)
         for _ in range(3):
             np.testing.assert_array_equal(
-                frnn.build_edges(
+                frnn_cuda.build_edges(
                     points, radius=1.0, max_neighbors=1, directed=True
                 ),
                 actual,
@@ -131,17 +131,17 @@ class PythonBindingTests(unittest.TestCase):
 
     def test_no_duplicate_edges(self):
         points = np.asarray([[0, 0], [0.1, 0], [0.2, 0]], dtype=np.float32)
-        edges = frnn.build_edges(points, radius=1.0, max_neighbors=3)
+        edges = frnn_cuda.build_edges(points, radius=1.0, max_neighbors=3)
         pairs = list(map(tuple, edges.T.tolist()))
         self.assertEqual(len(pairs), len(set(pairs)))
         self.assertTrue(all(source > target for source, target in pairs))
 
     def test_repeated_calls(self):
         points = np.zeros((4, 4), dtype=np.float32)
-        first = frnn.build_edges(points, radius=1.0, max_neighbors=4)
+        first = frnn_cuda.build_edges(points, radius=1.0, max_neighbors=4)
         for _ in range(10):
             np.testing.assert_array_equal(
-                frnn.build_edges(points, radius=1.0, max_neighbors=4),
+                frnn_cuda.build_edges(points, radius=1.0, max_neighbors=4),
                 first,
             )
 
@@ -157,20 +157,20 @@ class PythonBindingTests(unittest.TestCase):
         for value, error in invalid_cases:
             with self.subTest(value=type(value).__name__):
                 with self.assertRaises(error):
-                    frnn.build_edges(
+                    frnn_cuda.build_edges(
                         value, radius=1.0, max_neighbors=2
                     )
         for radius in (0.0, -1.0, math.nan, math.inf):
             with self.assertRaises(ValueError):
-                frnn.build_edges(
+                frnn_cuda.build_edges(
                     valid, radius=radius, max_neighbors=2
                 )
         with self.assertRaises(ValueError):
-            frnn.build_edges(valid, radius=1.0, max_neighbors=-1)
+            frnn_cuda.build_edges(valid, radius=1.0, max_neighbors=-1)
         nonfinite = valid.copy()
         nonfinite[0, 0] = np.nan
         with self.assertRaises(ValueError):
-            frnn.build_edges(nonfinite, radius=1.0, max_neighbors=2)
+            frnn_cuda.build_edges(nonfinite, radius=1.0, max_neighbors=2)
 
     def test_cpp_python_shared_fixture(self):
         # This fixture is also asserted by tests/test_frnn.cpp.
@@ -186,7 +186,7 @@ class PythonBindingTests(unittest.TestCase):
             dtype=np.float32,
         )
         self.assert_edges_equal(
-            frnn.build_edges(points, radius=0.42, max_neighbors=4),
+            frnn_cuda.build_edges(points, radius=0.42, max_neighbors=4),
             reference_edges(points, radius=0.42, max_neighbors=4),
         )
 

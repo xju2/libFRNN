@@ -6,7 +6,7 @@ requires = [
 build-backend = "scikit_build_core.build"
 
 [project]
-name = "frnn"
+name = "frnn_cuda"
 version = "1.0.0"
 description = "Standalone CUDA fixed-radius nearest-neighbor library"
 readme = "README.md"
@@ -26,7 +26,7 @@ Repository = "https://github.com/xju2/libFRNN"
 
 [tool.scikit-build]
 cmake.version = ">=3.20"
-wheel.packages = ["python/frnn"]
+wheel.packages = ["python/frnn_cuda"]
 sdist.include = [
   "CMakeLists.txt",
   "Config.cmake.in",
@@ -38,7 +38,7 @@ sdist.include = [
   "src/frnn.cu",
   "src/include/frnn/*.hpp",
   "python/bindings.cpp",
-  "python/frnn/*.py",
+  "python/frnn_cuda/*.py",
   "tests/*.cpp",
   "tests/*.py",
   "tests/consumer/CMakeLists.txt",

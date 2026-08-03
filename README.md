@@ -154,6 +154,8 @@ count-first, allocates exact edge storage, and copies the output to the host.
 
 The optional package requires Python 3.9+, NumPy, pybind11, and
 scikit-build-core at build time. It does not require or import PyTorch.
+The `frnn_cuda` name intentionally allows it to coexist with the original
+PyTorch package named `frnn`.
 
 The build machine must provide an NVIDIA CUDA Toolkit with `nvcc` and CUDA
 headers/libraries compatible with its compiler and installed NVIDIA driver.

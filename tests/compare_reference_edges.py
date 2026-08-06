@@ -39,8 +39,8 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--module",
-        default="frnn",
-        help="Python module containing build_edges (default: frnn).",
+        default="frnn_cuda",
+        help="Python module containing build_edges (default: frnn_cuda).",
     )
     parser.add_argument(
         "--function",

@@ -2,7 +2,7 @@
 
 libFRNN is a standalone C++17/CUDA fixed-radius nearest-neighbor library. Its
 core has no dependency on Python, PyTorch, ATen, c10, TBB, NumPy, or a Python
-binding framework. The optional `frnn` Python package is a thin NumPy binding
+binding framework. The optional `frnn_cuda` Python package is a thin NumPy binding
 over the same installed C++ API.
 
 The implementation supports dimensions 1 through 32. It automatically
@@ -154,6 +154,8 @@ count-first, allocates exact edge storage, and copies the output to the host.
 
 The optional package requires Python 3.9+, NumPy, pybind11, and
 scikit-build-core at build time. It does not require or import PyTorch.
+The `frnn_cuda` name intentionally allows it to coexist with the original
+PyTorch package named `frnn`.
 
 The build machine must provide an NVIDIA CUDA Toolkit with `nvcc` and CUDA
 headers/libraries compatible with its compiler and installed NVIDIA driver.
@@ -171,13 +173,13 @@ or build a wheel:
 ```bash
 python -m pip install build
 python -m build
-python -m pip install dist/frnn-*.whl
+python -m pip install dist/frnn_cuda-*.whl
 ```
 
 The Python API is:
 
 ```python
-frnn.build_edges(
+frnn_cuda.build_edges(
     query,
     database=None,
     *,
@@ -192,10 +194,10 @@ For example:
 
 ```python
 import numpy as np
-import frnn
+import frnn_cuda
 
 points = np.asarray(points, dtype=np.float32, order="C")
-edges = frnn.build_edges(points, radius=0.5, max_neighbors=32)
+edges = frnn_cuda.build_edges(points, radius=0.5, max_neighbors=32)
 ```
 
 Inputs must be C-contiguous NumPy `float32` arrays shaped

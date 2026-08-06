@@ -100,9 +100,9 @@ The default C++-only build must not search for Python or binding libraries unles
 Provide a Python API with a simple interface similar to:
 
 ```python
-import frnn
+import frnn_cuda
 
-edges = frnn.build_edges(
+edges = frnn_cuda.build_edges(
     query,
     database,
     r_max: float,
@@ -179,7 +179,7 @@ Prefer a modern CMake-based Python packaging arrangement, such as:
 
 Python packaging requirements:
 
-* the package imports as `frnn`, unless an existing naming conflict requires a documented alternative;
+* the package imports as `frnn_cuda` to avoid conflicting with the original PyTorch package;
 * importing the package must not import PyTorch;
 * the built extension must link to the standalone FRNN core;
 * the algorithm must not be separately reimplemented in the binding;
@@ -234,10 +234,10 @@ A Python consumer must be able to use:
 
 ```python
 import numpy as np
-import frnn
+import frnn_cuda
 
 points = np.asarray(points, dtype=np.float32)
-edges = frnn.build_edges(points, radius=0.5, max_neighbors=32)
+edges = frnn_cuda.build_edges(points, radius=0.5, max_neighbors=32)
 ```
 
 ## test requirements
@@ -296,7 +296,7 @@ source .venv/bin/activate
 python -m pip install --upgrade pip
 python -m pip install .
 
-python -c "import frnn; print(frnn)"
+python -c "import frnn_cuda; print(frnn_cuda)"
 ```
 
 Run the Python test suite using the package as installed, not by relying only on imports from the source directory.

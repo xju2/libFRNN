@@ -2,8 +2,9 @@
 
 libFRNN is a standalone C++17/CUDA fixed-radius nearest-neighbor library. Its
 core has no dependency on Python, PyTorch, ATen, c10, TBB, NumPy, or a Python
-binding framework. The optional `frnn_cuda` Python package is a thin NumPy binding
-over the same installed C++ API.
+binding framework. The optional `frnn_cuda` Python package provides a thin
+NumPy binding and can additionally build a separate PyTorch adapter over the
+same installed C++ API.
 
 The implementation supports dimensions 1 through 32. It automatically
 dispatches small workloads to exact CUDA brute force and larger workloads to
@@ -135,6 +136,8 @@ row-major `[capacity, 2]`; `edge_count` is a device-resident signed 64-bit
 scalar. Use `requiredEdgeCapacity(query_count, max_neighbors)` to size it.
 Passing `edges=nullptr` requests count-only execution; in that mode `capacity`
 is ignored and the exact device-resident count is still populated.
+After synchronizing that count, `materializeEdgesAsync` can write the prepared
+edges into an exactly sized device allocation without repeating the search.
 
 Every memory operation, prefix sum, and kernel is enqueued on the supplied
 stream. The device API does not copy input coordinates to the host. Call
@@ -221,8 +224,54 @@ allowed and retain their separate indices.
 The Python call is synchronous. It copies both NumPy inputs from host memory to
 CUDA memory, calls the public standalone C++ API, synchronizes, and copies
 edges back to NumPy-owned host memory. Python users never manage internal grid
-or workspace buffers. Device-resident Python array interoperability is not yet
-provided.
+or workspace buffers. Device-resident Python array interoperability is not
+provided by the base NumPy binding.
+
+### Optional PyTorch CUDA interface
+
+PyTorch support is a separate build option. The standalone library and default
+Python package still neither require nor import PyTorch. Install PyTorch and the
+normal build requirements into the active environment, then build without pip
+isolation so CMake can find that installation:
+
+```bash
+python -m pip install torch scikit-build-core pybind11 numpy
+CMAKE_ARGS="-DFRNN_BUILD_TORCH=ON" \
+  python -m pip install --no-build-isolation .
+```
+
+`Torch_DIR` or `CMAKE_PREFIX_PATH` may be supplied explicitly when using a
+standalone LibTorch installation. With pip-installed PyTorch, CMake obtains the
+prefix from `torch.utils.cmake_prefix_path` automatically.
+
+The PyTorch API is deliberately separate so importing `frnn_cuda` does not
+import PyTorch:
+
+```python
+import torch
+from frnn_cuda.torch import build_edges
+
+points = torch.rand((100_000, 3), dtype=torch.float32, device="cuda")
+edges = build_edges(points, radius=0.03, max_neighbors=32)
+```
+
+Inputs must be contiguous, two-dimensional CUDA `torch.float32` tensors on the
+same device. The result is a CUDA `torch.int64` tensor shaped `[2, num_edges]`
+on that device. Coordinates and edges are never copied to the host. The
+operation uses PyTorch's current CUDA stream; because the output length is
+data-dependent, it synchronizes that stream to read the 8-byte edge count and
+again before releasing its temporary workspace. Device inputs must contain
+finite coordinates, matching the C++ device API contract. Edge indices are
+discrete and no autograd operation is registered. The `[2, num_edges]` result
+is a zero-copy transpose of row-major core storage and is therefore not
+contiguous; call `edges.contiguous()` only when a downstream operation requires
+it.
+
+Run the optional binding tests against the installed package with:
+
+```bash
+python tests/test_torch.py
+```
 
 To test an installed package rather than the source tree:
 
@@ -238,6 +287,8 @@ python tests/test_python.py
 - `<frnn/frnn.hpp>` provides host and device C++ interfaces over that core.
 - `_frnn` is built only with `FRNN_BUILD_PYTHON=ON`; it validates NumPy arrays
   and calls the public host API without reimplementing the algorithm.
+- `_frnn_torch` is built only with `FRNN_BUILD_TORCH=ON`; it registers the
+  device-resident Torch operator and calls the public asynchronous device API.
 
 The original kernel sources were derived from
 <https://github.com/murnanedaniel/FRNN> and

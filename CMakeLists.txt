@@ -23,6 +23,11 @@ option(BUILD_SHARED_LIBS "Build shared libraries instead of static libraries" ON
 option(FRNN_BUILD_TESTS "Build FRNN tests" ON)
 option(FRNN_BUILD_BENCHMARKS "Build FRNN benchmarks" OFF)
 option(FRNN_BUILD_PYTHON "Build Python bindings" OFF)
+option(FRNN_BUILD_TORCH "Build optional PyTorch CUDA bindings" OFF)
+
+if(FRNN_BUILD_TORCH AND NOT FRNN_BUILD_PYTHON)
+    message(FATAL_ERROR "FRNN_BUILD_TORCH requires FRNN_BUILD_PYTHON=ON")
+endif()
 
 find_package(CUDAToolkit REQUIRED)
 
@@ -107,8 +112,11 @@ if(FRNN_BUILD_BENCHMARKS)
     )
 endif()
 
-if(FRNN_BUILD_PYTHON)
+if(FRNN_BUILD_PYTHON OR FRNN_BUILD_TORCH)
     find_package(Python REQUIRED COMPONENTS Interpreter Development.Module)
+endif()
+
+if(FRNN_BUILD_PYTHON)
     find_package(pybind11 CONFIG REQUIRED)
     # NO_EXTRAS avoids pybind11's automatic LTO flags. Those flags can be
     # incompatible when nvcc and the selected host C++ compiler use different
@@ -117,4 +125,28 @@ if(FRNN_BUILD_PYTHON)
     target_link_libraries(_frnn PRIVATE frnn::frnn)
     target_compile_features(_frnn PRIVATE cxx_std_17)
     install(TARGETS _frnn LIBRARY DESTINATION frnn_cuda)
+endif()
+
+if(FRNN_BUILD_TORCH)
+    if(NOT Torch_DIR)
+        execute_process(
+            COMMAND "${Python_EXECUTABLE}" -c
+                    "import torch; print(torch.utils.cmake_prefix_path)"
+            RESULT_VARIABLE FRNN_TORCH_PREFIX_RESULT
+            OUTPUT_VARIABLE FRNN_TORCH_PREFIX
+            OUTPUT_STRIP_TRAILING_WHITESPACE
+            ERROR_QUIET
+        )
+        if(FRNN_TORCH_PREFIX_RESULT EQUAL 0)
+            list(PREPEND CMAKE_PREFIX_PATH "${FRNN_TORCH_PREFIX}")
+        endif()
+    endif()
+    find_package(Torch REQUIRED CONFIG)
+    separate_arguments(FRNN_TORCH_CXX_FLAGS NATIVE_COMMAND
+                       "${TORCH_CXX_FLAGS}")
+    Python_add_library(_frnn_torch MODULE WITH_SOABI python/torch_bindings.cpp)
+    target_link_libraries(_frnn_torch PRIVATE frnn::frnn "${TORCH_LIBRARIES}")
+    target_compile_features(_frnn_torch PRIVATE cxx_std_17)
+    target_compile_options(_frnn_torch PRIVATE ${FRNN_TORCH_CXX_FLAGS})
+    install(TARGETS _frnn_torch LIBRARY DESTINATION frnn_cuda)
 endif()

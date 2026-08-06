@@ -76,6 +76,8 @@ class Workspace {
   friend void buildEdgesAsync(DevicePointView, DevicePointView,
                               DeviceEdgeBuffer, float, int, BuildOptions,
                               Workspace&, cudaStream_t);
+  friend void materializeEdgesAsync(std::int64_t*, std::int64_t, Workspace&,
+                                    cudaStream_t);
   friend std::vector<Edge> buildEdges(PointView, PointView, float, int,
                                       BuildOptions);
 };
@@ -94,6 +96,14 @@ void buildEdgesAsync(DevicePointView query,
                      BuildOptions options,
                      Workspace& workspace,
                      cudaStream_t stream);
+
+// Writes the edges prepared by the most recent count-only buildEdgesAsync
+// call using this workspace. capacity must be at least the device edge_count
+// produced by that call. Enqueue this on the same stream as the count call.
+void materializeEdgesAsync(std::int64_t* edges,
+                           std::int64_t capacity,
+                           Workspace& workspace,
+                           cudaStream_t stream);
 
 // Synchronous host convenience API. Inputs are copied to the device and the
 // returned row-major Edge values are copied back to the host.

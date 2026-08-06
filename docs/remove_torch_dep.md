@@ -1,3 +1,7 @@
+> This document records the standalone-core migration requirements. The core
+> remains PyTorch-free; a later, separately built `FRNN_BUILD_TORCH` adapter is
+> documented in the README and does not change those core guarantees.
+
 Convert libFRNN into a standalone C++/CUDA library that can be integrated into either:
 
 1. a native C++ project through CMake; or

@@ -523,6 +523,17 @@ void testCallerStreamDeviceApi() {
               static_cast<std::int64_t>(
                   bruteForce(points, dimension, 0.5F, max_neighbors).size()),
           "count-only device API returned the wrong edge count");
+  frnn::materializeEdgesAsync(device_edges, edge_count, workspace, stream);
+  actual.resize(static_cast<std::size_t>(edge_count));
+  cudaRequire(cudaMemcpyAsync(actual.data(), device_edges,
+                              edge_count * sizeof(frnn::Edge),
+                              cudaMemcpyDeviceToHost, stream),
+              "copy exact materialized edges");
+  cudaRequire(cudaStreamSynchronize(stream),
+              "synchronize exact edge materialization");
+  require(actual == bruteForce(points, dimension, 0.5F, max_neighbors),
+          "exact edge materialization disagrees with reference");
+  actual.resize(static_cast<std::size_t>(capacity));
 
   for (int iteration = 0; iteration < 6; ++iteration) {
     const std::int64_t active_count = iteration % 2 == 0 ? 2 : point_count;

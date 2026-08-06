@@ -3,12 +3,10 @@
 from statistics import median
 from time import perf_counter
 
-import numpy as np
-import torch
-
 import frnn
 import frnn_cuda
-
+import numpy as np
+import torch
 
 MAX_NEIGHBORS = 32
 TARGET_NEIGHBORS = 8

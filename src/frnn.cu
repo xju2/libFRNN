@@ -872,7 +872,7 @@ __global__ void writeEdges(const int* neighbor_indices,
                            int query_count, int max_neighbors,
                            bool undirected,
                            const std::int64_t* edge_offsets,
-                           std::int64_t* edges) {
+                           std::int64_t capacity, std::int64_t* edges) {
   for (int query_index = blockIdx.x * blockDim.x + threadIdx.x;
        query_index < query_count;
        query_index += blockDim.x * gridDim.x) {
@@ -886,8 +886,10 @@ __global__ void writeEdges(const int* neighbor_indices,
         break;
       }
       if (!undirected || query_index > target) {
-        edges[output_index * 2] = query_index;
-        edges[output_index * 2 + 1] = target;
+        if (output_index < capacity) {
+          edges[output_index * 2] = query_index;
+          edges[output_index * 2 + 1] = target;
+        }
         ++output_index;
       }
     }
@@ -963,6 +965,10 @@ struct Workspace::Impl {
   std::int64_t* edge_offsets = nullptr;
   void* scan_temporary = nullptr;
   std::size_t scan_temporary_bytes = 0;
+  int materialize_query_count = 0;
+  int materialize_max_neighbors = 0;
+  bool materialize_undirected = false;
+  bool materialize_ready = false;
 };
 
 Workspace::Workspace() : impl_(std::make_unique<Impl>()) {}
@@ -1138,6 +1144,7 @@ void buildEdgesAsync(DevicePointView query, DevicePointView database,
                      DeviceEdgeBuffer output, float radius, int max_neighbors,
                      BuildOptions options, Workspace& workspace,
                      cudaStream_t stream) {
+  workspace.impl_->materialize_ready = false;
   validateView(query.size, query.dimension, query.data, "query");
   validateView(database.size, database.dimension, database.data, "database");
   if (query.dimension != database.dimension) {
@@ -1168,6 +1175,10 @@ void buildEdgesAsync(DevicePointView query, DevicePointView database,
     checkCuda(cudaMemsetAsync(output.edge_count, 0, sizeof(std::int64_t),
                               stream),
               "clear edge count");
+    workspace.impl_->materialize_query_count = 0;
+    workspace.impl_->materialize_max_neighbors = max_neighbors;
+    workspace.impl_->materialize_undirected = options.undirected;
+    workspace.impl_->materialize_ready = true;
     return;
   }
 
@@ -1259,11 +1270,12 @@ void buildEdgesAsync(DevicePointView query, DevicePointView database,
                 stream),
             "prefix sum edge counts");
   recordProfileEvent(7, stream);
+  memory.materialize_query_count = query_count;
+  memory.materialize_max_neighbors = max_neighbors;
+  memory.materialize_undirected = options.undirected;
+  memory.materialize_ready = true;
   if (!count_only) {
-    writeEdges<<<blocksFor(query.size), kThreads, 0, stream>>>(
-        memory.neighbor_indices, query_count, max_neighbors,
-        options.undirected, memory.edge_offsets, output.edges);
-    checkCuda(cudaPeekAtLastError(), "launch writeEdges");
+    materializeEdgesAsync(output.edges, output.capacity, workspace, stream);
   }
   recordProfileEvent(8, stream);
   checkCuda(cudaMemcpyAsync(
@@ -1271,6 +1283,31 @@ void buildEdgesAsync(DevicePointView query, DevicePointView database,
                 sizeof(std::int64_t), cudaMemcpyDeviceToDevice, stream),
             "copy edge count");
   recordProfileEvent(9, stream);
+}
+
+void materializeEdgesAsync(std::int64_t* edges, std::int64_t capacity,
+                           Workspace& workspace, cudaStream_t stream) {
+  if (capacity < 0) {
+    throw std::invalid_argument("edge capacity must be non-negative");
+  }
+  if (capacity > 0 && edges == nullptr) {
+    throw std::invalid_argument(
+        "edges must not be null when capacity is positive");
+  }
+  Workspace::Impl& memory = *workspace.impl_;
+  if (!memory.materialize_ready) {
+    throw std::logic_error(
+        "materializeEdgesAsync requires a preceding count-only build");
+  }
+  if (memory.materialize_query_count == 0 || capacity == 0) {
+    return;
+  }
+  writeEdges<<<blocksFor(memory.materialize_query_count), kThreads, 0,
+               stream>>>(
+      memory.neighbor_indices, memory.materialize_query_count,
+      memory.materialize_max_neighbors, memory.materialize_undirected,
+      memory.edge_offsets, capacity, edges);
+  checkCuda(cudaPeekAtLastError(), "launch writeEdges");
 }
 
 #if defined(FRNN_ENABLE_STAGE_PROFILING)
@@ -1392,12 +1429,7 @@ std::vector<Edge> buildEdges(PointView query, PointView database, float radius,
       allocateDevice(&device_edges,
                      static_cast<std::size_t>(edge_count) * 2,
                      "allocate exact device edges");
-      Workspace::Impl& memory = *workspace.impl_;
-      writeEdges<<<blocksFor(query.size), kThreads, 0, stream>>>(
-          memory.neighbor_indices, static_cast<int>(query.size),
-          max_neighbors, options.undirected, memory.edge_offsets,
-          device_edges);
-      checkCuda(cudaPeekAtLastError(), "launch writeEdges");
+      materializeEdgesAsync(device_edges, edge_count, workspace, stream);
       checkCuda(cudaMemcpyAsync(
                     result.data(), device_edges,
                     static_cast<std::size_t>(edge_count) * sizeof(Edge),

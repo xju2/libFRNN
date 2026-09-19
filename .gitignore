@@ -39,6 +39,5 @@ build/
 dist/
 install/
 install-*/
-data/
 
 paper_draft/

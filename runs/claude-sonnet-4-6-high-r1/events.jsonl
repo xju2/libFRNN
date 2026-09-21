@@ -1,0 +1,2 @@
+{"event": "run_started", "timestamp": "2026-09-20T23:12:05.872175Z"}
+{"event": "run_finished", "return_code": 1, "status": "failed", "timestamp": "2026-09-21T00:43:58.346411Z", "wall_seconds": 5512.452502724016}

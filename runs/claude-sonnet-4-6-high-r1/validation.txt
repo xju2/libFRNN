@@ -1,0 +1,26 @@
+Internal ctest changing into directory: /workspace/libFRNN/build-archive
+Test project /workspace/libFRNN/build-archive
+    Start 1: frnn_core_tests
+1/1 Test #1: frnn_core_tests ..................   Passed    2.43 sec
+
+100% tests passed, 0 tests failed out of 1
+
+Total Test time (real) =   2.43 sec
+WARNING: Running pip as the 'root' user can result in broken permissions and conflicting behaviour with the system package manager. It is recommended to use a virtual environment instead: https://pip.pypa.io/warnings/venv
+Loading embedding from /workspace/libFRNN/data/embedding_data.csv ...
+Loading reference edges from /workspace/libFRNN/data/edge_list.csv ...
+Calling frnn.build_edges(embedding, radius=0.12, max_neighbors=1000) ...
+
+build_edges time:       0.628 s
+reference edges:        9,279,672
+libFRNN edges:          9,279,672
+common edges:           9,279,672
+missing edges:          0
+extra edges:            0
+reference duplicates:  0
+libFRNN duplicates:     0
+precision:              1.00000000
+recall:                 1.00000000
+Jaccard similarity:     1.00000000
+
+PASS: precision and recall are both at least 100.00%.

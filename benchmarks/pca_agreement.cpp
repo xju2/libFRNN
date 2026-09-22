@@ -1,7 +1,6 @@
-// Quantify how much the PCA-rotation front-end changes the *result* on the
-// real D=12 embedding. Runs buildEdges twice in-process (rotation controlled
-// by FRNN_PCA_ROTATE via setenv before each call is not possible since the env
-// is read at reserve() time; instead run this binary twice and diff files).
+// Dump canonicalized edges for a PCA-rotation agreement check. Run this binary
+// once with FRNN_PCA_ROTATE=0 and once with FRNN_PCA_ROTATE=1, then compare the
+// output files.
 //
 // Usage: pca_agreement <embedding.csv> <N> <D> <radius> <K> <out.txt>
 #include <frnn/frnn.hpp>

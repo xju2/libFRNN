@@ -379,63 +379,93 @@ __global__ void rotatePoints(const float* __restrict__ points, int point_count,
   }
 }
 
-// Symmetric-eigensolver via cyclic Jacobi rotations on a small DxD matrix
-// (host side, D<=128). Returns eigenvectors as rows of `vectors` ordered by
-// descending eigenvalue. `a` is destroyed.
-void jacobiEigensolve(std::vector<double>& a, int n,
-                      std::vector<double>& eigenvalues,
-                      std::vector<double>& vectors_rowmajor) {
-  std::vector<double> v(static_cast<std::size_t>(n) * n, 0.0);
-  for (int i = 0; i < n; ++i) v[i * n + i] = 1.0;
+// Form the covariance matrix and solve its eigensystem in the caller's CUDA
+// stream. A single thread is intentional: D is at most 32, and keeping this
+// small Jacobi solve on the device preserves buildEdgesAsync's asynchronous
+// contract by avoiding a device-to-host round trip and stream synchronization.
+__global__ void solvePcaRotation(const double* __restrict__ sum,
+                                 const double* __restrict__ cross,
+                                 int point_count, int dimension,
+                                 float* __restrict__ rotation,
+                                 float* __restrict__ mean) {
+  if (blockIdx.x != 0 || threadIdx.x != 0) return;
+
+  extern __shared__ double storage[];
+  double* a = storage;
+  double* v = a + dimension * dimension;
+  int* order = reinterpret_cast<int*>(v + dimension * dimension);
+  const double inv_n = 1.0 / static_cast<double>(point_count);
+
+  for (int i = 0; i < dimension; ++i) mean[i] = sum[i] * inv_n;
+  for (int row = 0; row < dimension; ++row) {
+    const double row_mean = sum[row] * inv_n;
+    for (int column = 0; column < dimension; ++column) {
+      const int lo = min(row, column);
+      const int hi = max(row, column);
+      a[row * dimension + column] =
+          cross[lo * dimension + hi] * inv_n -
+          row_mean * (sum[column] * inv_n);
+      v[row * dimension + column] = row == column ? 1.0 : 0.0;
+    }
+  }
+
   for (int sweep = 0; sweep < 100; ++sweep) {
     double off = 0.0;
-    for (int p = 0; p < n; ++p)
-      for (int q = p + 1; q < n; ++q) off += a[p * n + q] * a[p * n + q];
+    for (int p = 0; p < dimension; ++p)
+      for (int q = p + 1; q < dimension; ++q)
+        off += a[p * dimension + q] * a[p * dimension + q];
     if (off < 1e-30) break;
-    for (int p = 0; p < n; ++p) {
-      for (int q = p + 1; q < n; ++q) {
-        const double apq = a[p * n + q];
-        if (std::fabs(apq) < 1e-300) continue;
-        const double app = a[p * n + p];
-        const double aqq = a[q * n + q];
+    for (int p = 0; p < dimension; ++p) {
+      for (int q = p + 1; q < dimension; ++q) {
+        const double apq = a[p * dimension + q];
+        if (fabs(apq) < 1e-300) continue;
+        const double app = a[p * dimension + p];
+        const double aqq = a[q * dimension + q];
         const double theta = (aqq - app) / (2.0 * apq);
-        const double t =
-            (theta >= 0 ? 1.0 : -1.0) /
-            (std::fabs(theta) + std::sqrt(theta * theta + 1.0));
-        const double c = 1.0 / std::sqrt(t * t + 1.0);
+        const double t = copysign(1.0, theta) /
+                         (fabs(theta) + sqrt(theta * theta + 1.0));
+        const double c = 1.0 / sqrt(t * t + 1.0);
         const double s = t * c;
-        for (int k = 0; k < n; ++k) {
-          const double akp = a[k * n + p];
-          const double akq = a[k * n + q];
-          a[k * n + p] = c * akp - s * akq;
-          a[k * n + q] = s * akp + c * akq;
+        for (int k = 0; k < dimension; ++k) {
+          const double akp = a[k * dimension + p];
+          const double akq = a[k * dimension + q];
+          a[k * dimension + p] = c * akp - s * akq;
+          a[k * dimension + q] = s * akp + c * akq;
         }
-        for (int k = 0; k < n; ++k) {
-          const double apk = a[p * n + k];
-          const double aqk = a[q * n + k];
-          a[p * n + k] = c * apk - s * aqk;
-          a[q * n + k] = s * apk + c * aqk;
+        for (int k = 0; k < dimension; ++k) {
+          const double apk = a[p * dimension + k];
+          const double aqk = a[q * dimension + k];
+          a[p * dimension + k] = c * apk - s * aqk;
+          a[q * dimension + k] = s * apk + c * aqk;
         }
-        for (int k = 0; k < n; ++k) {
-          const double vkp = v[k * n + p];
-          const double vkq = v[k * n + q];
-          v[k * n + p] = c * vkp - s * vkq;
-          v[k * n + q] = s * vkp + c * vkq;
+        for (int k = 0; k < dimension; ++k) {
+          const double vkp = v[k * dimension + p];
+          const double vkq = v[k * dimension + q];
+          v[k * dimension + p] = c * vkp - s * vkq;
+          v[k * dimension + q] = s * vkp + c * vkq;
         }
       }
     }
   }
-  // Eigenvalues on the diagonal; eigenvector j is column j of v.
-  std::vector<int> order(n);
-  for (int i = 0; i < n; ++i) order[i] = i;
-  std::sort(order.begin(), order.end(),
-            [&](int x, int y) { return a[x * n + x] > a[y * n + y]; });
-  eigenvalues.resize(n);
-  vectors_rowmajor.assign(static_cast<std::size_t>(n) * n, 0.0);
-  for (int r = 0; r < n; ++r) {
-    const int j = order[r];
-    eigenvalues[r] = a[j * n + j];
-    for (int i = 0; i < n; ++i) vectors_rowmajor[r * n + i] = v[i * n + j];
+
+  // Eigenvector j is column j of v. Sort its index by descending eigenvalue,
+  // then transpose the selected columns into row-major rotation vectors.
+  for (int i = 0; i < dimension; ++i) {
+    int insertion = i;
+    while (insertion > 0 &&
+           a[order[insertion - 1] * dimension + order[insertion - 1]] <
+               a[i * dimension + i]) {
+      order[insertion] = order[insertion - 1];
+      --insertion;
+    }
+    order[insertion] = i;
+  }
+  for (int output_axis = 0; output_axis < dimension; ++output_axis) {
+    const int eigenvector = order[output_axis];
+    for (int input_axis = 0; input_axis < dimension; ++input_axis) {
+      rotation[output_axis * dimension + input_axis] =
+          v[input_axis * dimension + eigenvector];
+    }
   }
 }
 
@@ -461,12 +491,9 @@ bool pcaRotationEnabled(int dimension) {
 // the per-axis mean of `points`, leaving both resident in device buffers
 // d_rotation (D*D floats) and d_mean (D floats).
 void computePcaRotation(const float* points, int point_count, int dimension,
-                        float* d_rotation, float* d_mean, cudaStream_t stream) {
+                        double* d_sum, double* d_cross, float* d_rotation,
+                        float* d_mean, cudaStream_t stream) {
   const std::size_t dd = static_cast<std::size_t>(dimension) * dimension;
-  double* d_sum = nullptr;
-  double* d_cross = nullptr;
-  checkCuda(cudaMalloc(&d_sum, dimension * sizeof(double)), "alloc pca sum");
-  checkCuda(cudaMalloc(&d_cross, dd * sizeof(double)), "alloc pca cross");
   checkCuda(cudaMemsetAsync(d_sum, 0, dimension * sizeof(double), stream),
             "clear pca sum");
   checkCuda(cudaMemsetAsync(d_cross, 0, dd * sizeof(double), stream),
@@ -477,46 +504,11 @@ void computePcaRotation(const float* points, int point_count, int dimension,
   accumulateMoments<<<blocks, kThreads, shmem, stream>>>(
       points, point_count, dimension, d_sum, d_cross);
   checkCuda(cudaPeekAtLastError(), "launch accumulateMoments");
-
-  std::vector<double> sum(dimension);
-  std::vector<double> cross(dd);
-  checkCuda(cudaMemcpyAsync(sum.data(), d_sum, dimension * sizeof(double),
-                            cudaMemcpyDeviceToHost, stream),
-            "copy pca sum");
-  checkCuda(cudaMemcpyAsync(cross.data(), d_cross, dd * sizeof(double),
-                            cudaMemcpyDeviceToHost, stream),
-            "copy pca cross");
-  checkCuda(cudaStreamSynchronize(stream), "sync pca moments");
-  cudaFree(d_sum);
-  cudaFree(d_cross);
-
-  const double inv_n = 1.0 / static_cast<double>(point_count);
-  std::vector<double> mean(dimension);
-  for (int i = 0; i < dimension; ++i) mean[i] = sum[i] * inv_n;
-  // Covariance (population) from cross-products: C[a,b] = E[xa xb] - ma mb.
-  std::vector<double> cov(dd, 0.0);
-  for (int a = 0; a < dimension; ++a) {
-    for (int b = a; b < dimension; ++b) {
-      const double c = cross[a * dimension + b] * inv_n - mean[a] * mean[b];
-      cov[a * dimension + b] = c;
-      cov[b * dimension + a] = c;
-    }
-  }
-  std::vector<double> eigenvalues;
-  std::vector<double> vectors;  // row-major, rows = eigenvectors desc.
-  jacobiEigensolve(cov, dimension, eigenvalues, vectors);
-
-  std::vector<float> rotation_f(dd);
-  std::vector<float> mean_f(dimension);
-  for (std::size_t i = 0; i < dd; ++i)
-    rotation_f[i] = static_cast<float>(vectors[i]);
-  for (int i = 0; i < dimension; ++i) mean_f[i] = static_cast<float>(mean[i]);
-  checkCuda(cudaMemcpyAsync(d_rotation, rotation_f.data(), dd * sizeof(float),
-                            cudaMemcpyHostToDevice, stream),
-            "upload pca rotation");
-  checkCuda(cudaMemcpyAsync(d_mean, mean_f.data(), dimension * sizeof(float),
-                            cudaMemcpyHostToDevice, stream),
-            "upload pca mean");
+  const std::size_t solve_shmem = 2 * dd * sizeof(double) +
+                                  dimension * sizeof(int);
+  solvePcaRotation<<<1, 1, solve_shmem, stream>>>(
+      d_sum, d_cross, point_count, dimension, d_rotation, d_mean);
+  checkCuda(cudaPeekAtLastError(), "launch solvePcaRotation");
 }
 
 
@@ -1195,6 +1187,8 @@ struct Workspace::Impl {
   // PCA-rotation front-end scratch (allocated lazily when FRNN_PCA_ROTATE=1).
   float* pca_rotation = nullptr;       // dimension * dimension
   float* pca_mean = nullptr;           // dimension
+  double* pca_sum = nullptr;           // dimension
+  double* pca_cross = nullptr;         // dimension * dimension
   float* rotated_database = nullptr;   // database_capacity * dimension
   float* rotated_query = nullptr;      // query_capacity * dimension
   float* neighbor_distances = nullptr;
@@ -1239,6 +1233,8 @@ void Workspace::clear() noexcept {
   freeDevice(impl_->sorted_database_indices);
   freeDevice(impl_->pca_rotation);
   freeDevice(impl_->pca_mean);
+  freeDevice(impl_->pca_sum);
+  freeDevice(impl_->pca_cross);
   freeDevice(impl_->rotated_database);
   freeDevice(impl_->rotated_query);
   freeDevice(impl_->neighbor_distances);
@@ -1276,6 +1272,8 @@ void Workspace::reserve(std::int64_t max_query_points,
                        dimension, max_neighbors);
   const bool needs_grid_storage =
       resolved_algorithm == SearchAlgorithm::grid;
+  const bool needs_pca =
+      needs_grid_storage && pcaRotationEnabled(dimension);
   const int required_grid_cells =
       needs_grid_storage ? maximumGridCells(dimension) : 0;
 
@@ -1288,7 +1286,8 @@ void Workspace::reserve(std::int64_t max_query_points,
       impl_->neighbor_capacity >= max_neighbors &&
       (!needs_grid_storage ||
        (impl_->has_grid_storage &&
-        impl_->grid_cell_capacity >= required_grid_cells))) {
+        impl_->grid_cell_capacity >= required_grid_cells &&
+        (impl_->pca_rotation != nullptr) == needs_pca))) {
     return;
   }
 
@@ -1330,7 +1329,7 @@ void Workspace::reserve(std::int64_t max_query_points,
       allocateDevice(&impl_->sorted_database_indices,
                      static_cast<std::size_t>(database_capacity),
                      "allocate sorted database indices");
-      if (pcaRotationEnabled(dimension)) {
+      if (needs_pca) {
         allocateDevice(&impl_->pca_rotation,
                        static_cast<std::size_t>(dimension_capacity) *
                            dimension_capacity,
@@ -1338,6 +1337,13 @@ void Workspace::reserve(std::int64_t max_query_points,
         allocateDevice(&impl_->pca_mean,
                        static_cast<std::size_t>(dimension_capacity),
                        "allocate pca mean");
+        allocateDevice(&impl_->pca_sum,
+                       static_cast<std::size_t>(dimension_capacity),
+                       "allocate pca sum");
+        allocateDevice(&impl_->pca_cross,
+                       static_cast<std::size_t>(dimension_capacity) *
+                           dimension_capacity,
+                       "allocate pca cross");
         allocateDevice(
             &impl_->rotated_database,
             static_cast<std::size_t>(database_capacity) * dimension_capacity,
@@ -1471,6 +1477,7 @@ void buildEdgesAsync(DevicePointView query, DevicePointView database,
     const float* grid_query = query.data;
     if (memory.pca_rotation != nullptr) {
       computePcaRotation(database.data, database_count, database.dimension,
+                         memory.pca_sum, memory.pca_cross,
                          memory.pca_rotation, memory.pca_mean, stream);
       rotatePoints<<<blocksFor(database.size), kThreads, 0, stream>>>(
           database.data, database_count, database.dimension,

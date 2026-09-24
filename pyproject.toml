@@ -7,7 +7,7 @@ build-backend = "scikit_build_core.build"
 
 [project]
 name = "frnn_cuda"
-version = "1.0.0"
+version = "1.0.1"
 description = "Standalone CUDA fixed-radius nearest-neighbor library"
 readme = "README.md"
 requires-python = ">=3.9"

@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
+#include <cstdlib>
 #include <limits>
 #include <sstream>
 #include <stdexcept>
@@ -306,6 +307,210 @@ __global__ void countingSort(const float* points, int point_count,
   }
 }
 
+// ---------------------------------------------------------------------------
+// PCA-rotation front-end (opt-in via FRNN_PCA_ROTATE=1).
+//
+// libFRNN builds its spatial grid on only the first min(D,4) coordinates and
+// prunes cells along those axes. When the data's variance is not concentrated
+// in columns 0-3 those axes prune weakly. Rotating both database and query
+// into the data's principal-component basis (highest-variance directions
+// first) is an orthonormal transform: all pairwise Euclidean distances are
+// preserved exactly (up to float32 roundoff), so returned neighbors are
+// unchanged, but the grid now cuts along the highest-variance axes and prunes
+// far more aggressively.
+//
+// Only the top `grid_dimensions` eigenvectors need to be exact for pruning to
+// improve, but we apply the full DxD rotation so distances stay exact.
+// ---------------------------------------------------------------------------
+
+// Accumulate sum and sum-of-cross-products (upper triangle) of the database in
+// one pass. Uses block-shared partials then a single global atomic add per
+// block. moments layout: [0..D) = column sums, [D..D+D*D) = row-major D*D
+// cross-product accumulator (we fill the full matrix for simplicity).
+__global__ void accumulateMoments(const float* __restrict__ points,
+                                  int point_count, int dimension,
+                                  double* __restrict__ sum,
+                                  double* __restrict__ cross) {
+  extern __shared__ double shared[];
+  double* s_sum = shared;                 // dimension
+  double* s_cross = shared + dimension;   // dimension * dimension
+  for (int i = threadIdx.x; i < dimension; i += blockDim.x) s_sum[i] = 0.0;
+  for (int i = threadIdx.x; i < dimension * dimension; i += blockDim.x)
+    s_cross[i] = 0.0;
+  __syncthreads();
+
+  for (int point = blockIdx.x * blockDim.x + threadIdx.x; point < point_count;
+       point += blockDim.x * gridDim.x) {
+    const float* row = points + static_cast<std::int64_t>(point) * dimension;
+    for (int a = 0; a < dimension; ++a) {
+      const double va = row[a];
+      atomicAdd(&s_sum[a], va);
+      for (int b = a; b < dimension; ++b) {
+        atomicAdd(&s_cross[a * dimension + b], va * row[b]);
+      }
+    }
+  }
+  __syncthreads();
+  for (int i = threadIdx.x; i < dimension; i += blockDim.x)
+    atomicAdd(&sum[i], s_sum[i]);
+  for (int a = 0; a < dimension; ++a)
+    for (int b = a + threadIdx.x; b < dimension; b += blockDim.x)
+      atomicAdd(&cross[a * dimension + b], s_cross[a * dimension + b]);
+}
+
+// Rotate points by an orthonormal DxD matrix (row-major, rotation[out*D+in]),
+// centering by mean first: out[out_axis] = sum_in R[out,in]*(x[in]-mean[in]).
+__global__ void rotatePoints(const float* __restrict__ points, int point_count,
+                             int dimension, const float* __restrict__ rotation,
+                             const float* __restrict__ mean,
+                             float* __restrict__ out) {
+  for (int point = blockIdx.x * blockDim.x + threadIdx.x; point < point_count;
+       point += blockDim.x * gridDim.x) {
+    const float* in_row = points + static_cast<std::int64_t>(point) * dimension;
+    float* out_row = out + static_cast<std::int64_t>(point) * dimension;
+    for (int o = 0; o < dimension; ++o) {
+      float acc = 0.0F;
+      const float* r = rotation + o * dimension;
+      for (int i = 0; i < dimension; ++i) {
+        acc = fmaf(r[i], in_row[i] - mean[i], acc);
+      }
+      out_row[o] = acc;
+    }
+  }
+}
+
+// Form the covariance matrix and solve its eigensystem in the caller's CUDA
+// stream. A single thread is intentional: D is at most 32, and keeping this
+// small Jacobi solve on the device preserves buildEdgesAsync's asynchronous
+// contract by avoiding a device-to-host round trip and stream synchronization.
+__global__ void solvePcaRotation(const double* __restrict__ sum,
+                                 const double* __restrict__ cross,
+                                 int point_count, int dimension,
+                                 float* __restrict__ rotation,
+                                 float* __restrict__ mean) {
+  if (blockIdx.x != 0 || threadIdx.x != 0) return;
+
+  extern __shared__ double storage[];
+  double* a = storage;
+  double* v = a + dimension * dimension;
+  int* order = reinterpret_cast<int*>(v + dimension * dimension);
+  const double inv_n = 1.0 / static_cast<double>(point_count);
+
+  for (int i = 0; i < dimension; ++i) mean[i] = sum[i] * inv_n;
+  for (int row = 0; row < dimension; ++row) {
+    const double row_mean = sum[row] * inv_n;
+    for (int column = 0; column < dimension; ++column) {
+      const int lo = min(row, column);
+      const int hi = max(row, column);
+      a[row * dimension + column] =
+          cross[lo * dimension + hi] * inv_n -
+          row_mean * (sum[column] * inv_n);
+      v[row * dimension + column] = row == column ? 1.0 : 0.0;
+    }
+  }
+
+  for (int sweep = 0; sweep < 100; ++sweep) {
+    double off = 0.0;
+    for (int p = 0; p < dimension; ++p)
+      for (int q = p + 1; q < dimension; ++q)
+        off += a[p * dimension + q] * a[p * dimension + q];
+    if (off < 1e-30) break;
+    for (int p = 0; p < dimension; ++p) {
+      for (int q = p + 1; q < dimension; ++q) {
+        const double apq = a[p * dimension + q];
+        if (fabs(apq) < 1e-300) continue;
+        const double app = a[p * dimension + p];
+        const double aqq = a[q * dimension + q];
+        const double theta = (aqq - app) / (2.0 * apq);
+        const double t = copysign(1.0, theta) /
+                         (fabs(theta) + sqrt(theta * theta + 1.0));
+        const double c = 1.0 / sqrt(t * t + 1.0);
+        const double s = t * c;
+        for (int k = 0; k < dimension; ++k) {
+          const double akp = a[k * dimension + p];
+          const double akq = a[k * dimension + q];
+          a[k * dimension + p] = c * akp - s * akq;
+          a[k * dimension + q] = s * akp + c * akq;
+        }
+        for (int k = 0; k < dimension; ++k) {
+          const double apk = a[p * dimension + k];
+          const double aqk = a[q * dimension + k];
+          a[p * dimension + k] = c * apk - s * aqk;
+          a[q * dimension + k] = s * apk + c * aqk;
+        }
+        for (int k = 0; k < dimension; ++k) {
+          const double vkp = v[k * dimension + p];
+          const double vkq = v[k * dimension + q];
+          v[k * dimension + p] = c * vkp - s * vkq;
+          v[k * dimension + q] = s * vkp + c * vkq;
+        }
+      }
+    }
+  }
+
+  // Eigenvector j is column j of v. Sort its index by descending eigenvalue,
+  // then transpose the selected columns into row-major rotation vectors.
+  for (int i = 0; i < dimension; ++i) {
+    int insertion = i;
+    while (insertion > 0 &&
+           a[order[insertion - 1] * dimension + order[insertion - 1]] <
+               a[i * dimension + i]) {
+      order[insertion] = order[insertion - 1];
+      --insertion;
+    }
+    order[insertion] = i;
+  }
+  for (int output_axis = 0; output_axis < dimension; ++output_axis) {
+    const int eigenvector = order[output_axis];
+    for (int input_axis = 0; input_axis < dimension; ++input_axis) {
+      rotation[output_axis * dimension + input_axis] =
+          v[input_axis * dimension + eigenvector];
+    }
+  }
+}
+
+// Decide whether to apply the PCA rotation front-end for a given problem.
+//
+// Heuristic default (auto): rotation only helps when the data has more
+// dimensions than the grid indexes (D > kGridDimensions). At D <= 4 the grid
+// already cuts along every coordinate, so reordering axes cannot improve
+// pruning and would only add the rotation's fixed cost. Because the variant is
+// bit-exact, enabling it on the grid path never changes results.
+//
+// FRNN_PCA_ROTATE overrides the heuristic explicitly: "1" forces on, "0"
+// forces off (e.g. to isolate the rotation cost in a benchmark).
+bool pcaRotationEnabled(int dimension) {
+  const char* value = std::getenv("FRNN_PCA_ROTATE");
+  if (value != nullptr && (value[0] == '0' || value[0] == '1')) {
+    return value[0] == '1';
+  }
+  return dimension > kGridDimensions;
+}
+
+// Compute the DxD PCA rotation (rows = eigenvectors, descending variance) and
+// the per-axis mean of `points`, leaving both resident in device buffers
+// d_rotation (D*D floats) and d_mean (D floats).
+void computePcaRotation(const float* points, int point_count, int dimension,
+                        double* d_sum, double* d_cross, float* d_rotation,
+                        float* d_mean, cudaStream_t stream) {
+  const std::size_t dd = static_cast<std::size_t>(dimension) * dimension;
+  checkCuda(cudaMemsetAsync(d_sum, 0, dimension * sizeof(double), stream),
+            "clear pca sum");
+  checkCuda(cudaMemsetAsync(d_cross, 0, dd * sizeof(double), stream),
+            "clear pca cross");
+  const int blocks = blocksFor(point_count);
+  const std::size_t shmem =
+      (dimension + dd) * sizeof(double);
+  accumulateMoments<<<blocks, kThreads, shmem, stream>>>(
+      points, point_count, dimension, d_sum, d_cross);
+  checkCuda(cudaPeekAtLastError(), "launch accumulateMoments");
+  const std::size_t solve_shmem = 2 * dd * sizeof(double) +
+                                  dimension * sizeof(int);
+  solvePcaRotation<<<1, 1, solve_shmem, stream>>>(
+      d_sum, d_cross, point_count, dimension, d_rotation, d_mean);
+  checkCuda(cudaPeekAtLastError(), "launch solvePcaRotation");
+}
+
 
 __device__ bool precedes(float lhs_distance, std::int64_t lhs_index,
                          float rhs_distance, std::int64_t rhs_index) {
@@ -456,7 +661,7 @@ __device__ float squaredDistance(const float* lhs, const float* rhs,
 // change radius membership or top-K ordering. For dimensions divisible by
 // four, the canonical pass issues four independent loads at a time.
 template <int StaticDimension>
-__device__ float squaredDistanceSoA(const float* soa, int idx,
+__device__ float squaredDistanceSoA(const float* __restrict__ soa, int idx,
                                     int database_count,
                                     const float* query_point,
                                     int runtime_dimension, float limit) {
@@ -473,13 +678,13 @@ __device__ float squaredDistanceSoA(const float* soa, int idx,
       const int axis2 = (axis0 + 2) % StaticDimension;
       const int axis3 = (axis0 + 3) % StaticDimension;
       const float difference0 =
-          soa[axis0 * database_count + idx] - query_point[axis0];
+          __ldg(&soa[axis0 * database_count + idx]) - query_point[axis0];
       const float difference1 =
-          soa[axis1 * database_count + idx] - query_point[axis1];
+          __ldg(&soa[axis1 * database_count + idx]) - query_point[axis1];
       const float difference2 =
-          soa[axis2 * database_count + idx] - query_point[axis2];
+          __ldg(&soa[axis2 * database_count + idx]) - query_point[axis2];
       const float difference3 =
-          soa[axis3 * database_count + idx] - query_point[axis3];
+          __ldg(&soa[axis3 * database_count + idx]) - query_point[axis3];
       screen_distance += difference0 * difference0 +
                          difference1 * difference1 +
                          difference2 * difference2 +
@@ -497,10 +702,10 @@ __device__ float squaredDistanceSoA(const float* soa, int idx,
       const int ax1 = ax0 + 1;
       const int ax2 = ax0 + 2;
       const int ax3 = ax0 + 3;
-      const float d0 = soa[ax0 * database_count + idx] - query_point[ax0];
-      const float d1 = soa[ax1 * database_count + idx] - query_point[ax1];
-      const float d2 = soa[ax2 * database_count + idx] - query_point[ax2];
-      const float d3 = soa[ax3 * database_count + idx] - query_point[ax3];
+      const float d0 = __ldg(&soa[ax0 * database_count + idx]) - query_point[ax0];
+      const float d1 = __ldg(&soa[ax1 * database_count + idx]) - query_point[ax1];
+      const float d2 = __ldg(&soa[ax2 * database_count + idx]) - query_point[ax2];
+      const float d3 = __ldg(&soa[ax3 * database_count + idx]) - query_point[ax3];
       distance = fmaf(d0, d0, distance);
       if (distance > limit) break;
       distance = fmaf(d1, d1, distance);
@@ -514,7 +719,7 @@ __device__ float squaredDistanceSoA(const float* soa, int idx,
 #pragma unroll
     for (int axis = 0; axis < StaticDimension; ++axis) {
       const float difference =
-          soa[axis * database_count + idx] - query_point[axis];
+          __ldg(&soa[axis * database_count + idx]) - query_point[axis];
       distance = fmaf(difference, difference, distance);
       if (distance > limit) {
         break;
@@ -524,7 +729,7 @@ __device__ float squaredDistanceSoA(const float* soa, int idx,
     // Runtime dimension: 1 axis per iteration with early exit.
     for (int axis = 0; axis < dimension; ++axis) {
       const float difference =
-          soa[axis * database_count + idx] - query_point[axis];
+          __ldg(&soa[axis * database_count + idx]) - query_point[axis];
       distance = fmaf(difference, difference, distance);
       if (distance > limit) {
         break;
@@ -589,22 +794,33 @@ __global__ void findNeighborsBruteForce(
 template <int StaticDimension, int SearchThreads, bool InputsAreSame>
 __global__ __launch_bounds__(SearchThreads, SearchThreads == 128 ? 8 : 4)
 void findNeighbors(
-    const float* query, int query_count, const float* database,
-    const float* sorted_database,
-    const int* sorted_database_indices, int database_count, int dimension,
-    const GridParameters* parameters, const int* grid_offsets,
+    const float* __restrict__ query,
+    const float* __restrict__ grid_query, int query_count,
+    const float* __restrict__ database,
+    const float* __restrict__ sorted_database,
+    const int* __restrict__ sorted_database_indices, int database_count,
+    int dimension,
+    const GridParameters* __restrict__ parameters,
+    const int* __restrict__ grid_offsets,
     float radius, int max_neighbors, bool exclude_self,
-    const int* query_indices, float* neighbor_distances,
-    int* neighbor_indices) {
+    const int* __restrict__ query_indices,
+    float* __restrict__ neighbor_distances,
+    int* __restrict__ neighbor_indices) {
   const float radius_squared = radius * radius;
+  // #2: Load the device-computed grid parameters once into a register-resident
+  // copy. The struct is warp-uniform and read many times per query in the cell
+  // loop; a single cached read collapses those repeated global dereferences.
+  const GridParameters grid = *parameters;
   for (int work_index = blockIdx.x * blockDim.x + threadIdx.x;
        work_index < query_count;
        work_index += blockDim.x * gridDim.x) {
     const int query_index =
         query_indices == nullptr ? work_index : query_indices[work_index];
-    // Read query coordinates from AoS query.data using query_index.
-    // For identical-set, query_index is the original index (via sorted_database_indices),
-    // so this reads the correct original-order coordinates from AoS query.data.
+    // query_point holds original-frame coordinates and drives the final
+    // squared distance so results are bit-identical to the un-rotated build.
+    // grid_point holds the PCA-rotated coordinates (equal to query_point when
+    // rotation is off) and is used only for grid cell selection and AABB
+    // pruning, where the rotated basis concentrates variance on axes 0..3.
     const float* query_point = query + query_index * dimension;
     float cached_query[StaticDimension == 0 ? 1 : StaticDimension];
     if constexpr (StaticDimension != 0) {
@@ -613,6 +829,14 @@ void findNeighbors(
         cached_query[axis] = query_point[axis];
       }
       query_point = cached_query;
+    }
+    // Grid math only ever reads the first grid_dimensions (<= kGridDimensions)
+    // axes, so a small fixed cache suffices regardless of StaticDimension.
+    const float* grid_source = grid_query + query_index * dimension;
+    float grid_point[kGridDimensions];
+#pragma unroll
+    for (int axis = 0; axis < kGridDimensions; ++axis) {
+      grid_point[axis] = grid_source[axis];
     }
     float* distances =
         neighbor_distances + static_cast<std::int64_t>(query_index) *
@@ -625,27 +849,27 @@ void findNeighbors(
 
     int minimum_cell[kGridDimensions] = {0, 0, 0, 0};
     int maximum_cell[kGridDimensions] = {0, 0, 0, 0};
-    for (int axis = 0; axis < parameters->grid_dimensions; ++axis) {
-      const float coordinate = query_point[axis];
+    for (int axis = 0; axis < grid.grid_dimensions; ++axis) {
+      const float coordinate = grid_point[axis];
       const float coordinate_delta =
-          coordinate - parameters->minimum[axis];
+          coordinate - grid.minimum[axis];
       const float range_error =
           cellRangeError(coordinate_delta, radius,
-                         parameters->inverse_cell_size);
+                         grid.inverse_cell_size);
       minimum_cell[axis] = max(
           0, static_cast<int>(floorf(
                  (coordinate_delta - radius) *
-                     parameters->inverse_cell_size -
+                     grid.inverse_cell_size -
                  range_error)));
       maximum_cell[axis] =
-          min(parameters->resolution[axis] - 1,
+          min(grid.resolution[axis] - 1,
               static_cast<int>(floorf(
                   (coordinate_delta + radius) *
-                      parameters->inverse_cell_size +
+                      grid.inverse_cell_size +
                   range_error)));
     }
 
-    const float cell_size = 1.0f / parameters->inverse_cell_size;
+    const float cell_size = 1.0f / grid.inverse_cell_size;
     const float cell_limit = expandedSquaredLimit(radius_squared);
     for (int x = minimum_cell[0]; x <= maximum_cell[0]; ++x) {
       for (int y = minimum_cell[1]; y <= maximum_cell[1]; ++y) {
@@ -654,32 +878,32 @@ void findNeighbors(
             // Four-dimensional grids visit many corner cells whose bounding
             // boxes cannot intersect the radius. The same check is not worth
             // its arithmetic cost for the smaller three-dimensional stencil.
-            if (parameters->grid_dimensions >= 4) {
+            if (grid.grid_dimensions >= 4) {
               const float g0 = minimumCellGap(
-                  query_point[0], parameters->minimum[0], x, cell_size);
+                  grid_point[0], grid.minimum[0], x, cell_size);
               float sq = g0 * g0;
               const float g1 = minimumCellGap(
-                  query_point[1], parameters->minimum[1], y, cell_size);
+                  grid_point[1], grid.minimum[1], y, cell_size);
               sq += g1 * g1;
               if (sq > cell_limit) continue;
               const float g2 = minimumCellGap(
-                  query_point[2], parameters->minimum[2], z, cell_size);
+                  grid_point[2], grid.minimum[2], z, cell_size);
               sq += g2 * g2;
               if (sq > cell_limit) continue;
               const float g3 = minimumCellGap(
-                  query_point[3], parameters->minimum[3], w, cell_size);
+                  grid_point[3], grid.minimum[3], w, cell_size);
               sq += g3 * g3;
               if (sq > cell_limit) continue;
             }
             const int cell =
-                ((x * parameters->resolution[1] + y) *
-                     parameters->resolution[2] +
+                ((x * grid.resolution[1] + y) *
+                     grid.resolution[2] +
                  z) *
-                    parameters->resolution[3] +
+                    grid.resolution[3] +
                 w;
             const int begin = grid_offsets[cell];
             const int end =
-                cell + 1 < parameters->total_cells
+                cell + 1 < grid.total_cells
                     ? grid_offsets[cell + 1]
                     : database_count;
             for (int sorted_index = begin; sorted_index < end;
@@ -766,7 +990,8 @@ void launchBruteForceNeighbors(
 }
 
 void launchGridNeighbors(
-    const float* query, int query_count, const float* database,
+    const float* query, const float* grid_query, int query_count,
+    const float* database,
     const float* sorted_database,
     const int* sorted_database_indices, int database_count, int dimension,
     const GridParameters* parameters, const int* grid_offsets,
@@ -779,7 +1004,7 @@ void launchGridNeighbors(
 #define FRNN_LAUNCH_GRID(Dimension, SearchThreads, InputsAreSame)           \
   findNeighbors<Dimension, SearchThreads, InputsAreSame>                    \
       <<<blocks, SearchThreads, 0, stream>>>(                              \
-      query, query_count, database, sorted_database,                         \
+      query, grid_query, query_count, database, sorted_database,             \
       sorted_database_indices,                                               \
       database_count, dimension, parameters, grid_offsets, radius,           \
       max_neighbors, exclude_self, query_indices,                            \
@@ -959,6 +1184,13 @@ struct Workspace::Impl {
   int* point_cell_indices = nullptr;
   float* sorted_database = nullptr;
   int* sorted_database_indices = nullptr;
+  // PCA-rotation front-end scratch (allocated lazily when FRNN_PCA_ROTATE=1).
+  float* pca_rotation = nullptr;       // dimension * dimension
+  float* pca_mean = nullptr;           // dimension
+  double* pca_sum = nullptr;           // dimension
+  double* pca_cross = nullptr;         // dimension * dimension
+  float* rotated_database = nullptr;   // database_capacity * dimension
+  float* rotated_query = nullptr;      // query_capacity * dimension
   float* neighbor_distances = nullptr;
   int* neighbor_indices = nullptr;
   std::int64_t* edge_counts = nullptr;
@@ -999,6 +1231,12 @@ void Workspace::clear() noexcept {
   freeDevice(impl_->point_cell_indices);
   freeDevice(impl_->sorted_database);
   freeDevice(impl_->sorted_database_indices);
+  freeDevice(impl_->pca_rotation);
+  freeDevice(impl_->pca_mean);
+  freeDevice(impl_->pca_sum);
+  freeDevice(impl_->pca_cross);
+  freeDevice(impl_->rotated_database);
+  freeDevice(impl_->rotated_query);
   freeDevice(impl_->neighbor_distances);
   freeDevice(impl_->neighbor_indices);
   freeDevice(impl_->edge_counts);
@@ -1034,6 +1272,8 @@ void Workspace::reserve(std::int64_t max_query_points,
                        dimension, max_neighbors);
   const bool needs_grid_storage =
       resolved_algorithm == SearchAlgorithm::grid;
+  const bool needs_pca =
+      needs_grid_storage && pcaRotationEnabled(dimension);
   const int required_grid_cells =
       needs_grid_storage ? maximumGridCells(dimension) : 0;
 
@@ -1046,7 +1286,8 @@ void Workspace::reserve(std::int64_t max_query_points,
       impl_->neighbor_capacity >= max_neighbors &&
       (!needs_grid_storage ||
        (impl_->has_grid_storage &&
-        impl_->grid_cell_capacity >= required_grid_cells))) {
+        impl_->grid_cell_capacity >= required_grid_cells &&
+        (impl_->pca_rotation != nullptr) == needs_pca))) {
     return;
   }
 
@@ -1088,6 +1329,30 @@ void Workspace::reserve(std::int64_t max_query_points,
       allocateDevice(&impl_->sorted_database_indices,
                      static_cast<std::size_t>(database_capacity),
                      "allocate sorted database indices");
+      if (needs_pca) {
+        allocateDevice(&impl_->pca_rotation,
+                       static_cast<std::size_t>(dimension_capacity) *
+                           dimension_capacity,
+                       "allocate pca rotation");
+        allocateDevice(&impl_->pca_mean,
+                       static_cast<std::size_t>(dimension_capacity),
+                       "allocate pca mean");
+        allocateDevice(&impl_->pca_sum,
+                       static_cast<std::size_t>(dimension_capacity),
+                       "allocate pca sum");
+        allocateDevice(&impl_->pca_cross,
+                       static_cast<std::size_t>(dimension_capacity) *
+                           dimension_capacity,
+                       "allocate pca cross");
+        allocateDevice(
+            &impl_->rotated_database,
+            static_cast<std::size_t>(database_capacity) * dimension_capacity,
+            "allocate rotated database");
+        allocateDevice(
+            &impl_->rotated_query,
+            static_cast<std::size_t>(query_capacity) * dimension_capacity,
+            "allocate rotated query");
+      }
     }
     const std::size_t neighbor_values =
         static_cast<std::size_t>(query_capacity) * neighbor_capacity;
@@ -1204,10 +1469,36 @@ void buildEdgesAsync(DevicePointView query, DevicePointView database,
     checkCuda(cudaPeekAtLastError(), "launch findNeighborsBruteForce");
   } else {
     const int grid_dimensions = gridDimensionCount(query.dimension);
+
+    // Optional PCA-rotation front-end: rotate database (and query) into the
+    // principal-component basis so the grid axes carry the highest variance.
+    // Orthonormal transform -> distances and returned indices are unchanged.
+    const float* grid_database = database.data;
+    const float* grid_query = query.data;
+    if (memory.pca_rotation != nullptr) {
+      computePcaRotation(database.data, database_count, database.dimension,
+                         memory.pca_sum, memory.pca_cross,
+                         memory.pca_rotation, memory.pca_mean, stream);
+      rotatePoints<<<blocksFor(database.size), kThreads, 0, stream>>>(
+          database.data, database_count, database.dimension,
+          memory.pca_rotation, memory.pca_mean, memory.rotated_database);
+      checkCuda(cudaPeekAtLastError(), "launch rotatePoints (database)");
+      if (options.inputs_are_same) {
+        grid_query = memory.rotated_database;
+      } else {
+        rotatePoints<<<blocksFor(query.size), kThreads, 0, stream>>>(
+            query.data, query_count, query.dimension, memory.pca_rotation,
+            memory.pca_mean, memory.rotated_query);
+        checkCuda(cudaPeekAtLastError(), "launch rotatePoints (query)");
+        grid_query = memory.rotated_query;
+      }
+      grid_database = memory.rotated_database;
+    }
+
     initializeBounds<<<1, kGridDimensions, 0, stream>>>(memory.bounds);
     checkCuda(cudaPeekAtLastError(), "launch initializeBounds");
     computeBounds<<<blocksFor(database.size), kThreads, 0, stream>>>(
-        database.data, database_count, database.dimension, grid_dimensions,
+        grid_database, database_count, database.dimension, grid_dimensions,
         memory.bounds);
     checkCuda(cudaPeekAtLastError(), "launch computeBounds");
     finalizeGrid<<<1, 1, 0, stream>>>(
@@ -1220,7 +1511,7 @@ void buildEdgesAsync(DevicePointView query, DevicePointView database,
                               grid_cell_capacity * sizeof(int), stream),
               "clear grid counts");
     insertPoints<<<blocksFor(database.size), kThreads, 0, stream>>>(
-        database.data, database_count, database.dimension,
+        grid_database, database_count, database.dimension,
         memory.grid_parameters, memory.grid_counts, memory.point_cells,
         memory.point_cell_indices);
     checkCuda(cudaPeekAtLastError(), "launch insertPoints");
@@ -1232,6 +1523,11 @@ void buildEdgesAsync(DevicePointView query, DevicePointView database,
                   stream),
               "prefix sum grid counts");
     recordProfileEvent(3, stream);
+    // Bit-exact rotation: cells were assigned from the rotated frame, but we
+    // reorder the *original* coordinates into sorted_database so the final
+    // squared distance is computed in the un-rotated frame (identical to a
+    // build with rotation off). When rotation is off, database.data ==
+    // grid_database and this is unchanged.
     countingSort<<<blocksFor(database.size), kThreads, 0, stream>>>(
         database.data, database_count, database.dimension,
         memory.point_cells,
@@ -1241,12 +1537,16 @@ void buildEdgesAsync(DevicePointView query, DevicePointView database,
     recordProfileEvent(4, stream);
 
     // For identical-set, iterate queries in spatial order for better cache
-    // locality on the sorted_database SoA access.
+    // locality on the sorted_database SoA access. Grid cell selection and AABB
+    // pruning use the rotated frame (grid_query); the final distance uses the
+    // original frame (query.data / sorted_database) for bit-exact results.
     const float* search_query = query.data;
+    const float* search_grid_query = grid_query;
     const int* search_query_indices =
         options.inputs_are_same ? memory.sorted_database_indices : nullptr;
     launchGridNeighbors(
-        search_query, query_count, database.data, memory.sorted_database,
+        search_query, search_grid_query, query_count, database.data,
+        memory.sorted_database,
         memory.sorted_database_indices, database_count, query.dimension,
         memory.grid_parameters, memory.grid_offsets,
         radius, max_neighbors,

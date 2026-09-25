@@ -73,6 +73,40 @@ options.algorithm = frnn::SearchAlgorithm::grid;
 
 The forced choices change only the algorithm, not result semantics.
 
+## PCA-rotated grid indexing
+
+For dimensions above four, the grid indexes only the first four coordinates,
+so its pruning power depends on how much of the data's variance those
+coordinates carry. When the highest-variance directions do not align with the
+first axes, cells are unevenly populated and more candidates survive pruning.
+
+libFRNN can rotate the point cloud into its principal-component frame before
+placing points into cells, so the four indexed columns hold the
+highest-variance directions. The rotation is computed in the caller's CUDA
+stream from the data's covariance matrix and is orthonormal, hence
+distance-preserving.
+
+The rotation affects only cell placement and axis-aligned bounding-box
+pruning. Candidate distances and acceptance are always evaluated in the
+original, un-rotated frame, so the emitted edges are byte-identical to a build
+with the rotation disabled. The feature trades a small one-time rotation cost
+for fewer surviving candidates; on a 12-dimensional embedding
+(271,663 points, K=1000, radius=0.12) it measured about a 1.5x end-to-end
+speedup on an NVIDIA A100 with identical output.
+
+Rotation is selected automatically: it is enabled when the dimension exceeds
+four and disabled otherwise. The `FRNN_PCA_ROTATE` environment variable
+overrides the heuristic — set it to `1` to force rotation on or `0` to force
+it off:
+
+```bash
+FRNN_PCA_ROTATE=1 ./build/frnn_benchmark --embedding data/embedding_data.csv
+FRNN_PCA_ROTATE=0 ./build/frnn_benchmark --embedding data/embedding_data.csv
+```
+
+Because output is identical either way, the override exists for measurement
+and diagnosis rather than to change results.
+
 ## C++ installation and use
 
 Required tools are CMake 3.20 or newer, a C++17 compiler, and a compatible CUDA
@@ -338,8 +372,10 @@ experiments, and remaining bottlenecks are in
 
 ## Known limitations
 
-- Dimensions above four use the first four coordinates for grid indexing,
-  although distance and acceptance use every coordinate.
+- The grid uses at most four coordinates for indexing, although distance and
+  acceptance use every coordinate. For dimensions above four, automatic
+  PCA-rotated indexing (see above) aligns those coordinates with the
+  highest-variance directions without changing output.
 - Dense or highly correlated high-dimensional clouds can still generate many
   candidates and dominate latency.
 - The host convenience API is synchronous and creates a fresh device workspace

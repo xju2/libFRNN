@@ -1,0 +1,31 @@
+libFRNN commit: 9047af9d556b
+SNN commit: ea7a2db86ce1
+threads: 128
+batch size: 1024
+radius: 0.12
+Loading embedding from /global/u1/d/dratnam/libFRNN/data/embedding_data.csv ...
+Loading reference edges from /global/u1/d/dratnam/libFRNN/data/edge_list.csv ...
+progress: 25,600/271,663 points (9.4%), query time so far: 18.919 s
+progress: 51,200/271,663 points (18.8%), query time so far: 38.281 s
+progress: 76,800/271,663 points (28.3%), query time so far: 56.381 s
+progress: 102,400/271,663 points (37.7%), query time so far: 76.579 s
+progress: 128,000/271,663 points (47.1%), query time so far: 97.080 s
+progress: 153,600/271,663 points (56.5%), query time so far: 117.777 s
+progress: 179,200/271,663 points (66.0%), query time so far: 138.187 s
+progress: 204,800/271,663 points (75.4%), query time so far: 157.196 s
+progress: 230,400/271,663 points (84.8%), query time so far: 176.262 s
+progress: 256,000/271,663 points (94.2%), query time so far: 195.116 s
+progress: 271,663/271,663 points (100.0%), query time so far: 207.107 s
+
+SNN index time:           0.253 s
+SNN query time:           207.107 s
+Sweep + validation time:  209.564 s
+SNN non-self edges:       9,279,672
+Reference edges:          9,279,672
+Mismatched sources:       16
+Exact agreement:          NO
+Mismatch source 65245: expected=35, actual=36, missing=[], extra=[84095]
+Mismatch source 84095: expected=74, actual=75, missing=[], extra=[65245]
+Mismatch source 84996: expected=164, actual=165, missing=[], extra=[179671]
+Mismatch source 85021: expected=125, actual=126, missing=[], extra=[85172]
+Mismatch source 85172: expected=57, actual=58, missing=[], extra=[85021]

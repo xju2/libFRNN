@@ -308,7 +308,7 @@ __global__ void countingSort(const float* points, int point_count,
 }
 
 // ---------------------------------------------------------------------------
-// PCA-rotation front-end (opt-in via FRNN_PCA_ROTATE=1).
+// PCA-rotation front-end (on by default for D > 4; FRNN_PCA_ROTATE overrides).
 //
 // libFRNN builds its spatial grid on only the first min(D,4) coordinates and
 // prunes cells along those axes. When the data's variance is not concentrated
@@ -1171,7 +1171,7 @@ struct Workspace::Impl {
   int* point_cell_indices = nullptr;
   float* sorted_database = nullptr;
   int* sorted_database_indices = nullptr;
-  // PCA-rotation front-end scratch (allocated lazily when FRNN_PCA_ROTATE=1).
+  // PCA-rotation front-end scratch (allocated when pcaRotationEnabled()).
   float* pca_rotation = nullptr;       // dimension * dimension
   float* pca_mean = nullptr;           // dimension
   double* pca_sum = nullptr;           // dimension
@@ -1274,7 +1274,7 @@ void Workspace::reserve(std::int64_t max_query_points,
       (!needs_grid_storage ||
        (impl_->has_grid_storage &&
         impl_->grid_cell_capacity >= required_grid_cells &&
-        (impl_->pca_rotation != nullptr) == needs_pca))) {
+        (!needs_pca || impl_->pca_rotation != nullptr)))) {
     return;
   }
 
@@ -1286,6 +1286,9 @@ void Workspace::reserve(std::int64_t max_query_points,
       std::max(impl_->dimension_capacity, dimension);
   const int neighbor_capacity =
       std::max(impl_->neighbor_capacity, max_neighbors);
+  // PCA scratch is a capacity like the others: once allocated it is kept, so
+  // a workspace alternating between D <= 4 and D > 4 does not reallocate.
+  const bool pca_capacity = needs_pca || impl_->pca_rotation != nullptr;
   clear();
   impl_->device = current_device;
   impl_->query_capacity = query_capacity;
@@ -1316,7 +1319,7 @@ void Workspace::reserve(std::int64_t max_query_points,
       allocateDevice(&impl_->sorted_database_indices,
                      static_cast<std::size_t>(database_capacity),
                      "allocate sorted database indices");
-      if (needs_pca) {
+      if (pca_capacity) {
         allocateDevice(&impl_->pca_rotation,
                        static_cast<std::size_t>(dimension_capacity) *
                            dimension_capacity,
@@ -1462,7 +1465,8 @@ void buildEdgesAsync(DevicePointView query, DevicePointView database,
     // Orthonormal transform -> distances and returned indices are unchanged.
     const float* grid_database = database.data;
     const float* grid_query = query.data;
-    if (memory.pca_rotation != nullptr) {
+    if (memory.pca_rotation != nullptr &&
+        pcaRotationEnabled(database.dimension)) {
       computePcaRotation(database.data, database_count, database.dimension,
                          memory.pca_sum, memory.pca_cross,
                          memory.pca_rotation, memory.pca_mean, stream);

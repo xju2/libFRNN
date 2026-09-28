@@ -823,9 +823,9 @@ void findNeighbors(
     // Grid math only ever reads the first grid_dimensions (<= kGridDimensions)
     // axes, so a small fixed cache suffices regardless of StaticDimension.
     const float* grid_source = grid_query + query_index * dimension;
-    float grid_point[kGridDimensions];
+    float grid_point[kGridDimensions] = {};
 #pragma unroll
-    for (int axis = 0; axis < kGridDimensions; ++axis) {
+    for (int axis = 0; axis < grid.grid_dimensions; ++axis) {
       grid_point[axis] = grid_source[axis];
     }
     float* distances =

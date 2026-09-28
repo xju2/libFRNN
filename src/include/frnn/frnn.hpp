@@ -21,6 +21,8 @@ struct DevicePointView {
   int dimension = 0;
 };
 
+// Output edges are grouped by ascending source; order within a source is
+// unspecified. Selection prefers smaller distances, then smaller target indices.
 struct Edge {
   std::int64_t source;
   std::int64_t target;

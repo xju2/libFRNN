@@ -14,7 +14,7 @@ every input dimension.
 
 ## Algorithm and exactness
 
-Both production search paths implement the same canonical result:
+Both production search paths select the same canonical edge set:
 
 1. accumulate squared Euclidean distance in `float32` dimension order with
    one fused multiply-add per coordinate;
@@ -54,7 +54,10 @@ For large K, selection begins as a sorted insertion list and converts to a
 deterministic max-heap only after a query accepts 24 candidates. This avoids
 heap overhead for sparse queries and avoids quadratic insertion shifting for
 dense queries. An internal `-1` index marks the end of a short neighbor row;
-sentinels are not exposed in edge output.
+sentinels are not exposed in edge output. The final heap is emitted without
+sorting. Edges are grouped by ascending source index; target order within
+each source is unspecified, while nearest-K membership and tie-breaking
+remain unchanged.
 
 Automatic brute-force dispatch uses this overflow-safe work rule:
 
@@ -72,6 +75,40 @@ options.algorithm = frnn::SearchAlgorithm::grid;
 ```
 
 The forced choices change only the algorithm, not result semantics.
+
+## PCA-rotated grid indexing
+
+For dimensions above four, the grid indexes only the first four coordinates,
+so its pruning power depends on how much of the data's variance those
+coordinates carry. When the highest-variance directions do not align with the
+first axes, cells are unevenly populated and more candidates survive pruning.
+
+libFRNN can rotate the point cloud into its principal-component frame before
+placing points into cells, so the four indexed columns hold the
+highest-variance directions. The rotation is computed in the caller's CUDA
+stream from the data's covariance matrix and is orthonormal, hence
+distance-preserving.
+
+The rotation affects only cell placement and axis-aligned bounding-box
+pruning. Candidate distances and acceptance are always evaluated in the
+original, un-rotated frame, so the emitted edge set is identical to a build
+with the rotation disabled. The feature trades a small one-time rotation cost
+for fewer surviving candidates; on a 12-dimensional embedding
+(271,663 points, K=1000, radius=0.12) it measured about a 1.5x end-to-end
+speedup on an NVIDIA A100 with identical output.
+
+Rotation is selected automatically: it is enabled when the dimension exceeds
+four and disabled otherwise. The `FRNN_PCA_ROTATE` environment variable
+overrides the heuristic — set it to `1` to force rotation on or `0` to force
+it off:
+
+```bash
+FRNN_PCA_ROTATE=1 ./build/frnn_benchmark --embedding data/embedding_data.csv
+FRNN_PCA_ROTATE=0 ./build/frnn_benchmark --embedding data/embedding_data.csv
+```
+
+Because output is identical either way, the override exists for measurement
+and diagnosis rather than to change results.
 
 ## C++ installation and use
 
@@ -338,8 +375,10 @@ experiments, and remaining bottlenecks are in
 
 ## Known limitations
 
-- Dimensions above four use the first four coordinates for grid indexing,
-  although distance and acceptance use every coordinate.
+- The grid uses at most four coordinates for indexing, although distance and
+  acceptance use every coordinate. For dimensions above four, automatic
+  PCA-rotated indexing (see above) aligns those coordinates with the
+  highest-variance directions without changing output.
 - Dense or highly correlated high-dimensional clouds can still generate many
   candidates and dominate latency.
 - The host convenience API is synchronous and creates a fresh device workspace

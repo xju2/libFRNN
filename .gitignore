@@ -41,4 +41,10 @@ install/
 install-*/
 data/
 
+# Large, reproducible PCA experiment artifacts.
+benchmarks/results/ab/
+benchmarks/results/edges_base.txt
+benchmarks/results/edges_rot.txt
+benchmarks/results/embedding_data_pca.csv
+
 paper_draft/

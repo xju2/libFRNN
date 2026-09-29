@@ -40,6 +40,7 @@ dist/
 install/
 install-*/
 data/
+/data
 
 # Large, reproducible PCA experiment artifacts.
 benchmarks/results/ab/

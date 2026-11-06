@@ -92,13 +92,24 @@ void requireAgreement(const std::vector<float>& query,
                       float radius, int max_neighbors,
                       frnn::BuildOptions options,
                       const std::string& context) {
-  const auto expected =
+  auto expected =
       bruteForce(query, query_count, database, database_count, dimension,
                  radius, max_neighbors, options);
-  const auto actual = frnn::buildEdges(
+  auto actual = frnn::buildEdges(
       {query.data(), query_count, dimension},
       {database.data(), database_count, dimension}, radius, max_neighbors,
       options);
+  const auto edge_less = [](const frnn::Edge& lhs, const frnn::Edge& rhs) {
+    return lhs.source < rhs.source ||
+           (lhs.source == rhs.source && lhs.target < rhs.target);
+  };
+  require(std::is_sorted(actual.begin(), actual.end(),
+                         [](const frnn::Edge& lhs, const frnn::Edge& rhs) {
+                           return lhs.source < rhs.source;
+                         }), context + " source groups are out of order");
+  // Compare multisets so duplicate edges still fail the oracle check.
+  std::sort(actual.begin(), actual.end(), edge_less);
+  std::sort(expected.begin(), expected.end(), edge_less);
   if (actual != expected) {
     std::ostringstream message;
     message << context << " disagrees with brute-force oracle: expected "
@@ -350,6 +361,29 @@ void testAutomaticDispatchThreshold() {
   requireAgreement(query, query_count, database, upper_database_count,
                    dimension, 0.015F, max_neighbors, options,
                    "automatic dispatch immediately above threshold");
+}
+
+void testUnsortedHeapAgreement() {
+  // Duplicate coordinates exercise tie-breaking at the K cutoff. K=128
+  // also checks short heap rows and their terminating sentinel.
+  std::vector<float> points;
+  for (int i = 0; i < 96; ++i) {
+    points.push_back(static_cast<float>((i * 37) % 48) / 48.0F);
+  }
+  for (auto algorithm : {frnn::SearchAlgorithm::grid,
+                         frnn::SearchAlgorithm::brute_force}) {
+    for (int k : {64, 128}) {
+      for (bool undirected : {false, true}) {
+        frnn::BuildOptions options;
+        options.algorithm = algorithm;
+        options.inputs_are_same = true;
+        options.exclude_self = true;
+        options.undirected = undirected;
+        requireAgreement(points, 96, points, 96, 1, 2.0F, k, options,
+                         "unsorted heap membership");
+      }
+    }
+  }
 }
 
 void testRandomizedDifferential() {
@@ -660,6 +694,7 @@ int main() {
     testEmptyAndInvalidInput();
     testAllDispatchPaths();
     testAutomaticDispatchThreshold();
+    testUnsortedHeapAgreement();
     testRandomizedDifferential();
     testCompatibilityLayout();
     testCallerStreamDeviceApi();

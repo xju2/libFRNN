@@ -110,6 +110,9 @@ if(FRNN_BUILD_BENCHMARKS)
         CUDA_STANDARD 17
         CUDA_STANDARD_REQUIRED ON
     )
+    add_executable(frnn_pca_agreement benchmarks/pca_agreement.cpp)
+    target_link_libraries(frnn_pca_agreement PRIVATE frnn::frnn)
+    target_compile_features(frnn_pca_agreement PRIVATE cxx_std_17)
 endif()
 
 if(FRNN_BUILD_PYTHON OR FRNN_BUILD_TORCH)

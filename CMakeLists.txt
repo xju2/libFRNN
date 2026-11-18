@@ -31,7 +31,7 @@ endif()
 
 find_package(CUDAToolkit REQUIRED)
 
-add_library(frnn src/frnn.cu)
+add_library(frnn src/frnn.cu src/fast_path.cu)
 add_library(frnn::frnn ALIAS frnn)
 set_target_properties(frnn PROPERTIES
     EXPORT_NAME frnn

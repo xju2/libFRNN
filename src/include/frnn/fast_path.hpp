@@ -19,7 +19,8 @@ namespace frnn {
 //
 // On success, *edges receives a buffer allocated with std::aligned_alloc
 // (release it with std::free) holding 2 * (*edge_count) int64 values laid out
-// as [sources..., targets...].  Edge order is unspecified.
+// as [sources..., targets...], grouped by ascending source; target order
+// within a source is unspecified.
 bool buildEdgesFast(const float* points, std::int64_t size, int dimension,
                     float radius, int max_neighbors, bool exclude_self,
                     bool undirected, std::int64_t** edges,

@@ -11,6 +11,7 @@
 #include <cstdlib>
 #include <new>
 #include <functional>
+#include <map>
 #include <mutex>
 #include <stdexcept>
 #include <string>
@@ -28,10 +29,18 @@ constexpr int kWarpBuffer = 256;
 constexpr int kWarpsPerBlock = 4;
 constexpr int kChunks = 16;
 
-// Host result storage handed to the caller (freed with std::free).
+// Host result storage handed to the caller (freed with std::free); move-only,
+// freed on destruction unless ownership is taken by nulling ptr.
 struct HostBuffer {
   std::int64_t* ptr = nullptr;
   std::size_t bytes = 0;
+  HostBuffer() = default;
+  HostBuffer(HostBuffer&& o) noexcept : ptr(o.ptr), bytes(o.bytes) { o.ptr = nullptr; o.bytes = 0; }
+  HostBuffer& operator=(HostBuffer&& o) noexcept {
+    if (this != &o) { release(); ptr = o.ptr; bytes = o.bytes; o.ptr = nullptr; o.bytes = 0; }
+    return *this;
+  }
+  ~HostBuffer() { release(); }
   static HostBuffer make(std::size_t elements) {
     HostBuffer h;
     const std::size_t align = std::size_t(1) << 21;
@@ -358,9 +367,12 @@ struct Buffers {
   cudaEvent_t events[32] = {};
 };
 
+// One cache per CUDA device: streams and allocations are device-bound.
 Buffers& buffers() {
-  static Buffers* instance = new Buffers();  // intentionally leaked at exit
-  return *instance;
+  int device = 0;
+  check(cudaGetDevice(&device), "get device");
+  static auto* instances = new std::map<int, Buffers>();  // intentionally leaked at exit
+  return (*instances)[device];
 }
 std::mutex& fastMutex() {
   static std::mutex m;
@@ -378,20 +390,17 @@ void grow(T*& pointer, std::size_t& capacity, std::size_t bytes, const char* wha
   capacity = want;
 }
 
-void parallelFor(std::int64_t count, std::int64_t grain,
-                 const std::function<void(std::int64_t, std::int64_t)>& body) {
-  const std::int64_t hw = std::max(1u, std::thread::hardware_concurrency());
-  const std::int64_t chunks = std::min<std::int64_t>(std::min<std::int64_t>(hw, 24),
-                                                     std::max<std::int64_t>(1, count / grain));
-  if (chunks <= 1) { body(0, count); return; }
-  const std::int64_t step = (count + chunks - 1) / chunks;
-  std::vector<std::thread> threads;
-  for (std::int64_t c = 1; c < chunks; ++c) {
-    const std::int64_t begin = c * step, end = std::min(count, begin + step);
-    if (begin < end) threads.emplace_back(body, begin, end);
-  }
-  body(0, std::min(count, step));
-  for (auto& t : threads) t.join();
+// Joins every started thread on scope exit, including exception paths.
+struct Joiner {
+  std::vector<std::thread> list;
+  ~Joiner() { for (auto& t : list) t.join(); }
+};
+
+// Runs body(t) for t in [0, count); t = 0 runs on the calling thread.
+void parallel(int count, const std::function<void(int)>& body) {
+  Joiner threads;
+  for (int t = 1; t < count; ++t) threads.list.emplace_back(body, t);
+  body(0);
 }
 
 template <int D>
@@ -470,7 +479,8 @@ bool run(const float* host_points, int n, float radius, int max_neighbors,
     check(cudaHostAlloc(&b.host_edges, want * sizeof(int), cudaHostAllocMapped), "alloc mapped edges");
     b.host_edges_cap = want;
   };
-  ensureHost(static_cast<std::size_t>(std::max(n, 1 << 19)) * 64 * 2);
+  // Successful output is at most n * max_neighbors edges; larger guesses retry.
+  ensureHost(static_cast<std::size_t>(n) * std::min(max_neighbors, 64) * 2);
   unsigned long long capacity = b.host_edges_cap / 2;
   int* device_edges = nullptr;
   check(cudaHostGetDevicePointer(reinterpret_cast<void**>(&device_edges), b.host_edges, 0), "mapped pointer");
@@ -478,7 +488,8 @@ bool run(const float* host_points, int n, float radius, int max_neighbors,
     for (auto& e : b.events) check(cudaEventCreateWithFlags(&e, cudaEventDisableTiming), "event");
   }
   for (int attempt = 0; attempt < 2; ++attempt) {
-    check(cudaMemsetAsync(b.small + 96, 0, 4 * sizeof(unsigned), s), "memset");
+    // Reset counter and max degree only; word 99 holds the non-finite flag.
+    check(cudaMemsetAsync(b.small + 96, 0, 3 * sizeof(unsigned), s), "memset");
     check(cudaMemsetAsync(b.degree, 0, sizeof(int) * n, s), "memset degree");
     searchKernel<D><<<(leaves + kWarpsPerBlock - 1) / kWarpsPerBlock, kWarpsPerBlock * 32, 0, s>>>(
         b.sorted_points, b.sorted_indices, b.box_lo, b.box_hi, leaves, radius_squared,
@@ -492,29 +503,28 @@ bool run(const float* host_points, int n, float radius, int max_neighbors,
     const std::size_t estimate = b.last_count ? b.last_count + b.last_count / 4 + 4096
                                               : static_cast<std::size_t>(n) * 48 + 4096;
     HostBuffer out = HostBuffer::make(estimate * 2);
-    std::vector<std::thread> faulters;
-    if (out.ptr) {
-      const int nt = 8;
-      const std::size_t bytes = out.bytes;
-      char* base = reinterpret_cast<char*>(out.ptr);
-      for (int t = 0; t < nt; ++t) {
-        faulters.emplace_back([=]() {
-          const std::size_t begin = bytes * t / nt, end = bytes * (t + 1) / nt;
-          for (std::size_t o = begin & ~std::size_t(4095); o < end; o += 4096) base[o] = 0;
-        });
+    {
+      Joiner faulters;  // declared after `out`, so joined before it is freed
+      if (out.ptr) {
+        const int nt = 8;
+        const std::size_t bytes = out.bytes;
+        char* base = reinterpret_cast<char*>(out.ptr);
+        for (int t = 0; t < nt; ++t) {
+          faulters.list.emplace_back([=]() {
+            const std::size_t begin = bytes * t / nt, end = bytes * (t + 1) / nt;
+            for (std::size_t o = begin & ~std::size_t(4095); o < end; o += 4096) base[o] = 0;
+          });
+        }
       }
+      check(cudaStreamSynchronize(s), "synchronize search");
     }
-    check(cudaStreamSynchronize(s), "synchronize search");
-    for (auto& t : faulters) t.join();
     lap("gpu (h2d+build+search)");
     if (b.host_small[99] != 0 || static_cast<int>(b.host_small[98]) > max_neighbors) {
-      out.release();
       return false;
     }
     unsigned long long edge_count;
     std::memcpy(&edge_count, b.host_small + 96, sizeof(edge_count));
     if (edge_count > capacity) {
-      out.release();
       ensureHost(static_cast<std::size_t>(edge_count) * 2);
       capacity = b.host_edges_cap / 2;
       check(cudaHostGetDevicePointer(reinterpret_cast<void**>(&device_edges), b.host_edges, 0), "mapped pointer");
@@ -523,20 +533,46 @@ bool run(const float* host_points, int n, float radius, int max_neighbors,
     const std::int64_t count = static_cast<std::int64_t>(edge_count);
     b.last_count = static_cast<std::size_t>(count);
     if (out.ptr == nullptr || out.bytes < static_cast<std::size_t>(count) * 2 * sizeof(std::int64_t)) {
-      out.release();
       out = HostBuffer::make(static_cast<std::size_t>(count) * 2);
       if (out.ptr == nullptr) throw std::bad_alloc();
     }
     std::int64_t* output = out.ptr;
     const int* sources = b.host_edges;
     const int* targets = b.host_edges + capacity;
-    parallelFor(count, 1 << 17, [&](std::int64_t begin, std::int64_t end) {
-      for (std::int64_t i = begin; i < end; ++i) output[i] = sources[i];
-      for (std::int64_t i = begin; i < end; ++i) output[count + i] = targets[i];
+    // Widen to int64 and group by ascending source (the buildEdges contract)
+    // with a per-chunk counting sort; order within a source stays unspecified.
+    const int chunks = static_cast<int>(std::min<std::int64_t>(
+        std::min<unsigned>(24, std::max(1u, std::thread::hardware_concurrency())),
+        std::max<std::int64_t>(1, count >> 17)));
+    const std::int64_t step = (count + chunks - 1) / chunks;
+    const std::size_t un = static_cast<std::size_t>(n);
+    std::vector<int> rel(un * chunks);  // per-(chunk, source) count, then offset within source
+    std::vector<std::int64_t> start(un);
+    parallel(chunks, [&](int c) {
+      int* h = rel.data() + un * c;
+      for (std::int64_t i = c * step, e = std::min(count, i + step); i < e; ++i) ++h[sources[i]];
     });
-    check(cudaGetLastError(), "copy");
-    lap("copy+widen");
+    parallel(chunks, [&](int c) {
+      for (std::size_t v = un * c / chunks, e = un * (c + 1) / chunks; v < e; ++v) {
+        int sum = 0;
+        for (int k = 0; k < chunks; ++k) { const int x = rel[un * k + v]; rel[un * k + v] = sum; sum += x; }
+        start[v] = sum;
+      }
+    });
+    std::int64_t total = 0;
+    for (auto& v : start) { const std::int64_t x = v; v = total; total += x; }
+    parallel(chunks, [&](int c) {
+      int* h = rel.data() + un * c;
+      for (std::int64_t i = c * step, e = std::min(count, i + step); i < e; ++i) {
+        const int v = sources[i];
+        const std::int64_t p = start[v] + h[v]++;
+        output[p] = v;
+        output[count + p] = targets[i];
+      }
+    });
+    lap("copy+widen+group");
     *result = out.ptr;
+    out.ptr = nullptr;  // ownership passes to the caller
     *result_count = count;
     return true;
   }

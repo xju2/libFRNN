@@ -3,6 +3,7 @@ import math
 import subprocess
 import sys
 import unittest
+from pathlib import Path
 
 import numpy as np
 
@@ -47,12 +48,16 @@ class PythonBindingTests(unittest.TestCase):
         np.testing.assert_array_equal(actual, expected)
 
     def test_import_does_not_import_torch(self):
+        # -I drops PYTHONPATH, so pass the directory this test imported frnn_cuda from.
+        package_parent = str(Path(frnn_cuda.__file__).resolve().parents[1])
         completed = subprocess.run(
             [
                 sys.executable,
                 "-I",
                 "-c",
-                "import sys, frnn_cuda; assert 'torch' not in sys.modules",
+                "import sys; sys.path.insert(0, sys.argv[1]); import frnn_cuda; "
+                "assert 'torch' not in sys.modules",
+                package_parent,
             ],
             check=False,
             text=True,

@@ -1,9 +1,11 @@
+#include <frnn/fast_path.hpp>
 #include <frnn/frnn.hpp>
 
 #include <pybind11/numpy.h>
 #include <pybind11/pybind11.h>
 
 #include <cstdint>
+#include <cstdlib>
 #include <limits>
 #include <optional>
 #include <stdexcept>
@@ -77,6 +79,27 @@ py::array_t<std::int64_t> buildEdges(
   options.exclude_self = exclude_self;
   options.undirected = !directed;
   options.inputs_are_same = same_input;
+  if (same_input) {
+    std::int64_t* fast_edges = nullptr;
+    std::int64_t fast_count = 0;
+    bool ok = false;
+    {
+      py::gil_scoped_release release;
+      ok = frnn::buildEdgesFast(
+          query.points.data, query.points.size, query.points.dimension,
+          radius, max_neighbors, exclude_self, !directed, &fast_edges,
+          &fast_count);
+    }
+    if (ok) {
+      py::capsule owner(fast_edges, [](void* p) { std::free(p); });
+      return py::array_t<std::int64_t>(
+          {static_cast<py::ssize_t>(2), static_cast<py::ssize_t>(fast_count)},
+          {static_cast<py::ssize_t>(fast_count * sizeof(std::int64_t)),
+           static_cast<py::ssize_t>(sizeof(std::int64_t))},
+          fast_edges, owner);
+    }
+  }
+
   std::vector<frnn::Edge> edges;
   {
     py::gil_scoped_release release;

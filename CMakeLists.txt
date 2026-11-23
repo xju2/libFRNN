@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.20)
 
-project(libFRNN VERSION 1.0.0 LANGUAGES CXX CUDA)
+project(libFRNN VERSION 3.0.0 LANGUAGES CXX CUDA)
 
 include(GNUInstallDirs)
 include(CMakePackageConfigHelpers)

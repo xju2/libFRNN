@@ -37,6 +37,7 @@ sdist.include = [
   "docs/*.md",
   "examples/*.py",
   "src/frnn.cu",
+  "src/fast_path.cu",
   "src/include/frnn/*.hpp",
   "python/bindings.cpp",
   "python/torch_bindings.cpp",

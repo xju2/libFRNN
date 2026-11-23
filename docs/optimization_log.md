@@ -304,3 +304,67 @@ The broad final matrix is in
 256 neighbors, identical and separate query sets, default and non-default
 streams, and uniform, clustered, separated-cluster, boundary, duplicate,
 correlated, anisotropic, degenerate, and sorted distributions.
+
+## Fast identical-set path (kd-leaf symmetric search) — retained
+
+The Python `build_edges(points, ...)` call (identical query/database set) now
+tries `frnn::buildEdgesFast` (`src/fast_path.cu`) first, and falls back to the
+original exact grid/brute-force pipeline when the fast path does not apply.
+
+Design:
+
+1. GPU kd ordering with 32-point leaves. Split axes cycle through the
+   dimensions in decreasing-extent order, and each level is one 64-bit
+   `(node, ordered coordinate)` radix sort. This takes about 2.5 ms for the
+   real event.
+2. Per-leaf 12-D bounding boxes, stored dimension-major.
+3. One warp per query leaf, with symmetric processing: only candidate leaves
+   with index >= the warp's own leaf are visited. A pair from different leaves
+   emits both directed edges. This is exact because `fl(a-b) = -fl(b-a)`, so
+   the squared distance is bitwise symmetric.
+4. Exact-safe pruning, applied in order:
+   - leaf-box vs leaf-box;
+   - per-lane query point vs candidate-leaf box;
+   - candidate point vs query-leaf box.
+   Each bound uses monotone float operations, so it can never exceed the
+   computed distance; a 1e-4 relative margin is added anyway.
+5. Survivors are batched in shared memory, and the distance is evaluated with
+   the reference arithmetic: `(database - query)`, FMUL for the first term,
+   then FFMA, compared with `<= radius*radius`.
+6. Per-query degrees are accumulated atomically. If any degree exceeds
+   max_neighbors, top-K truncation would be required, so the fast path
+   returns false and the original exact path runs.
+7. Int32 edges are written by the kernel directly into mapped pinned host
+   memory. The host result buffer is allocated and prefaulted while the GPU
+   works, widened to int64 with parallel threads, and handed to NumPy via a
+   capsule without a copy. Buffers persist across calls with 1.5x growth
+   headroom.
+
+Measurements (RTX A6000, real event, Python end-to-end median):
+
+| Version | Median |
+|---|---:|
+| Original | 306 ms |
+| Warp-per-leaf, full scan | 67 ms |
+| Symmetric leaf pairs | 40 ms |
+| Mapped output and prefaulted result | 34.5 ms |
+
+At 34.5 ms the end-to-end median is about 8.9x faster than the original.
+The search kernel itself dropped from 166 ms to about 19 ms. All 9,279,672
+reference edges match exactly. A 27-case differential suite against the
+original package also matches exactly. It covers subsamples and jitter of the
+real event, dimensions 2–16, duplicates, quantized ties, dense cases where
+degree exceeds K (fallback), undirected output and tiny inputs.
+
+Rejected experiments:
+
+- Hierarchical kd traversal did not reduce survivors.
+- PCA-rotated coordinates pruned worse than raw coordinates.
+- An 8-bit quantized point filter was exact but gave only about a 1 ms gain.
+- Batching several leaves' loads per iteration was slower (46 ms).
+- Forcing occupancy with launch bounds: 64 registers spilled, and 80 registers
+  showed no gain.
+- 48 widening threads were slower than 24.
+
+Remaining cost: search about 19 ms, build plus H2D about 5 ms, host widening
+about 6 ms.

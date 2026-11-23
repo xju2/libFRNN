@@ -1,5 +1,6 @@
 #include <Python.h>
 
+#include <frnn/fast_path.hpp>
 #include <frnn/frnn.hpp>
 
 #include <ATen/ATen.h>
@@ -56,9 +57,27 @@ at::Tensor buildEdges(
   c10::cuda::CUDAGuard device_guard(query.device());
   const c10::cuda::CUDAStream stream =
       at::cuda::getCurrentCUDAStream(query.get_device());
+  const auto output_options = query.options().dtype(at::kLong);
+
+  // One point set: try the kd-leaf fast path. It declines (returns false) when
+  // it does not apply, e.g. a point with more than max_neighbors neighbors.
+  if (same_input) {
+    at::Tensor fast_edges;
+    std::int64_t fast_count = 0;
+    const bool fast = frnn::buildEdgesFastDevice(
+        query.data_ptr<float>(), query.size(0), static_cast<int>(query.size(1)),
+        static_cast<float>(radius), max_neighbors, exclude_self, !directed,
+        stream.stream(),
+        [&](std::int64_t count) {
+          fast_edges = at::empty({2, count}, output_options);
+          return fast_edges.data_ptr<std::int64_t>();
+        },
+        &fast_count);
+    if (fast) return fast_edges;
+  }
+
   const std::int64_t capacity =
       frnn::requiredEdgeCapacity(query.size(0), max_neighbors);
-  const auto output_options = query.options().dtype(at::kLong);
   at::Tensor edge_count = at::empty({}, output_options);
 
   frnn::BuildOptions options;

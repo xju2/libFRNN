@@ -11,6 +11,7 @@
 #include <cstdlib>
 #include <new>
 #include <functional>
+#include <limits>
 #include <map>
 #include <mutex>
 #include <stdexcept>
@@ -403,26 +404,21 @@ void parallel(int count, const std::function<void(int)>& body) {
   body(0);
 }
 
+void ensureSmall(Buffers& b) {
+  if (b.small != nullptr) return;
+  check(cudaMalloc(&b.small, 128 * sizeof(unsigned)), "alloc small");
+  check(cudaMallocHost(&b.host_small, 128 * sizeof(unsigned)), "alloc host small");
+}
+
+// Builds the kd ordering (sorted_points, sorted_indices, leaf boxes) of the n
+// device points on stream s, and resets the search counters.
 template <int D>
-bool run(const float* host_points, int n, float radius, int max_neighbors,
-         bool exclude_self, bool undirected, std::int64_t** result,
-         std::int64_t* result_count) {
-  const bool timing = std::getenv("FRNN_FAST_TIMING") != nullptr;
-  auto t0 = std::chrono::steady_clock::now();
-  auto lap = [&](const char* name) { if (timing) { auto t = std::chrono::steady_clock::now(); std::fprintf(stderr, "%s %.3f ms\n", name, std::chrono::duration<double, std::milli>(t - t0).count()); t0 = t; } };
-  Buffers& b = buffers();
-  if (b.stream == nullptr) {
-    check(cudaStreamCreateWithFlags(&b.stream, cudaStreamNonBlocking), "create stream");
-    check(cudaMalloc(&b.small, 128 * sizeof(unsigned)), "alloc small");
-    check(cudaMallocHost(&b.host_small, 128 * sizeof(unsigned)), "alloc host small");
-  }
-  cudaStream_t s = b.stream;
+void buildTree(Buffers& b, const float* points, int n, cudaStream_t s) {
   const int leaves = (n + kLeaf - 1) / kLeaf;
   const int padded = leaves * kLeaf;
   int levels = 0;
   while ((1 << levels) < leaves) ++levels;
   const std::size_t sz = static_cast<std::size_t>(padded);
-  grow(b.points, b.points_cap, sizeof(float) * n * D, "alloc points");
   grow(b.sorted_points, b.sorted_cap, sizeof(float) * sz * D, "alloc sorted");
   grow(b.perm, b.perm_cap, sizeof(int) * sz, "alloc perm");
   grow(b.perm_alt, b.perm_alt_cap, sizeof(int) * sz, "alloc perm");
@@ -437,26 +433,22 @@ bool run(const float* host_points, int n, float radius, int max_neighbors,
                                         b.perm_alt, n, 0, 32 + levels, s), "sort size");
   grow(b.scratch, b.scratch_cap, sort_bytes, "alloc scratch");
 
-  check(cudaMemcpyAsync(b.points, host_points, sizeof(float) * n * D,
-                        cudaMemcpyHostToDevice, s), "copy points");
   unsigned* minimum = b.small;
   unsigned* maximum = b.small + 32;
   int* axes = reinterpret_cast<int*>(b.small + 64);
-  unsigned long long* counter = reinterpret_cast<unsigned long long*>(b.small + 96);
-  int* max_count = reinterpret_cast<int*>(b.small + 98);
   int* non_finite = reinterpret_cast<int*>(b.small + 99);
   check(cudaMemsetAsync(minimum, 0xff, 32 * sizeof(unsigned), s), "memset");
   check(cudaMemsetAsync(maximum, 0, 32 * sizeof(unsigned), s), "memset");
   check(cudaMemsetAsync(b.small + 96, 0, 4 * sizeof(unsigned), s), "memset");
   const int threads = 256;
   const int blocks = std::max(1, std::min(1024, (n + threads - 1) / threads));
-  boundsKernel<D><<<std::min(blocks, 512), threads, 0, s>>>(b.points, n, minimum, maximum, non_finite);
+  boundsKernel<D><<<std::min(blocks, 512), threads, 0, s>>>(points, n, minimum, maximum, non_finite);
   axesKernel<<<1, 1, 0, s>>>(minimum, maximum, D, axes);
   iotaKernel<<<blocks, threads, 0, s>>>(b.perm, n);
   int* perm = b.perm;
   int* perm_alt = b.perm_alt;
   for (int level = 0; level < levels; ++level) {
-    keysKernel<D><<<(n + threads - 1) / threads, threads, 0, s>>>(b.points, perm, n, leaves,
+    keysKernel<D><<<(n + threads - 1) / threads, threads, 0, s>>>(points, perm, n, leaves,
                                                                   level, axes, b.keys);
     std::size_t bytes = b.scratch_cap;
     check(cub::DeviceRadixSort::SortPairs(b.scratch, bytes, b.keys, b.keys_alt, perm, perm_alt,
@@ -464,9 +456,33 @@ bool run(const float* host_points, int n, float radius, int max_neighbors,
     std::swap(perm, perm_alt);
   }
   gatherKernel<D><<<(padded + threads - 1) / threads, threads, 0, s>>>(
-      b.points, perm, n, padded, b.sorted_points, b.sorted_indices);
+      points, perm, n, padded, b.sorted_points, b.sorted_indices);
   leafBoxKernel<D><<<(padded + 127) / 128, 128, 0, s>>>(b.sorted_points, leaves, b.box_lo, b.box_hi);
   check(cudaGetLastError(), "launch build");
+}
+
+template <int D>
+bool run(const float* host_points, int n, float radius, int max_neighbors,
+         bool exclude_self, bool undirected, std::int64_t** result,
+         std::int64_t* result_count) {
+  const bool timing = std::getenv("FRNN_FAST_TIMING") != nullptr;
+  auto t0 = std::chrono::steady_clock::now();
+  auto lap = [&](const char* name) { if (timing) { auto t = std::chrono::steady_clock::now(); std::fprintf(stderr, "%s %.3f ms\n", name, std::chrono::duration<double, std::milli>(t - t0).count()); t0 = t; } };
+  Buffers& b = buffers();
+  if (b.stream == nullptr) {
+    check(cudaStreamCreateWithFlags(&b.stream, cudaStreamNonBlocking), "create stream");
+  }
+  ensureSmall(b);
+  cudaStream_t s = b.stream;
+  grow(b.points, b.points_cap, sizeof(float) * n * D, "alloc points");
+  check(cudaMemcpyAsync(b.points, host_points, sizeof(float) * n * D,
+                        cudaMemcpyHostToDevice, s), "copy points");
+  buildTree<D>(b, b.points, n, s);
+  const int leaves = (n + kLeaf - 1) / kLeaf;
+  const int threads = 256;
+  const int blocks = std::max(1, std::min(1024, (n + threads - 1) / threads));
+  unsigned long long* counter = reinterpret_cast<unsigned long long*>(b.small + 96);
+  int* max_count = reinterpret_cast<int*>(b.small + 98);
 
   const float radius_squared = radius * radius;
   const float prune_threshold = radius_squared * 1.0001F;
@@ -579,6 +595,103 @@ bool run(const float* host_points, int n, float radius, int max_neighbors,
   return false;
 }
 
+// (source, target) as one 64-bit key, so one radix sort orders by source, then target.
+__global__ void packEdgesKernel(const int* __restrict__ sources, const int* __restrict__ targets,
+                                long long count, unsigned long long* __restrict__ keys) {
+  for (long long i = blockIdx.x * static_cast<long long>(blockDim.x) + threadIdx.x; i < count;
+       i += static_cast<long long>(gridDim.x) * blockDim.x)
+    keys[i] = (static_cast<unsigned long long>(sources[i]) << 32) |
+              static_cast<unsigned>(targets[i]);
+}
+
+__global__ void unpackEdgesKernel(const unsigned long long* __restrict__ keys, long long count,
+                                  std::int64_t* __restrict__ out) {
+  for (long long i = blockIdx.x * static_cast<long long>(blockDim.x) + threadIdx.x; i < count;
+       i += static_cast<long long>(gridDim.x) * blockDim.x) {
+    out[i] = static_cast<std::int64_t>(keys[i] >> 32);
+    out[count + i] = static_cast<std::int64_t>(keys[i] & 0xffffffffull);
+  }
+}
+
+// Device-resident fast path: same tree and search as run<D>, but the points are
+// read in place, the edges stay in device memory, and they are grouped on the
+// GPU (radix sort by source, then target) instead of on host threads.
+template <int D>
+bool runDevice(const float* points, int n, float radius, int max_neighbors, bool exclude_self,
+               bool undirected, cudaStream_t s,
+               const std::function<std::int64_t*(std::int64_t)>& allocate,
+               std::int64_t* result_count) {
+  Buffers& b = buffers();
+  ensureSmall(b);
+  buildTree<D>(b, points, n, s);
+  const int leaves = (n + kLeaf - 1) / kLeaf;
+  const int threads = 256;
+  const int blocks = std::max(1, std::min(1024, (n + threads - 1) / threads));
+  unsigned long long* counter = reinterpret_cast<unsigned long long*>(b.small + 96);
+  int* max_count = reinterpret_cast<int*>(b.small + 98);
+  const float radius_squared = radius * radius;
+  const float prune_threshold = radius_squared * 1.0001F;
+  // Successful output is at most n * max_neighbors edges; a larger count retries once.
+  unsigned long long capacity =
+      b.last_count ? b.last_count + b.last_count / 4 + 4096
+                   : static_cast<unsigned long long>(n) * std::min(max_neighbors, 64);
+  for (int attempt = 0; attempt < 2; ++attempt) {
+    grow(b.edges, b.edges_cap, 2 * capacity * sizeof(int), "alloc device edges");
+    capacity = b.edges_cap / (2 * sizeof(int));
+    int* sources = b.edges;
+    int* targets = b.edges + capacity;
+    // Reset counter and max degree only; word 99 holds the non-finite flag.
+    check(cudaMemsetAsync(b.small + 96, 0, 3 * sizeof(unsigned), s), "memset");
+    check(cudaMemsetAsync(b.degree, 0, sizeof(int) * n, s), "memset degree");
+    searchKernel<D><<<(leaves + kWarpsPerBlock - 1) / kWarpsPerBlock, kWarpsPerBlock * 32, 0, s>>>(
+        b.sorted_points, b.sorted_indices, b.box_lo, b.box_hi, leaves, radius_squared,
+        prune_threshold, exclude_self, undirected, sources, targets, counter, capacity,
+        b.degree);
+    maxDegreeKernel<<<std::min(blocks, 256), threads, 0, s>>>(b.degree, n, max_count);
+    check(cudaGetLastError(), "launch search");
+    check(cudaMemcpyAsync(b.host_small + 96, b.small + 96, 4 * sizeof(unsigned),
+                          cudaMemcpyDeviceToHost, s), "copy counters");
+    check(cudaStreamSynchronize(s), "synchronize search");
+    if (b.host_small[99] != 0 || static_cast<int>(b.host_small[98]) > max_neighbors) {
+      return false;
+    }
+    unsigned long long edge_count;
+    std::memcpy(&edge_count, b.host_small + 96, sizeof(edge_count));
+    if (edge_count > capacity) {
+      capacity = edge_count + edge_count / 8 + 1024;
+      continue;
+    }
+    if (edge_count > static_cast<unsigned long long>(std::numeric_limits<int>::max())) {
+      return false;  // beyond cub's int item count; the general path handles it
+    }
+    const int count = static_cast<int>(edge_count);
+    b.last_count = edge_count;
+    int index_bits = 1;
+    while ((1ll << index_bits) < n) ++index_bits;
+    grow(b.keys, b.keys_cap, 8 * static_cast<std::size_t>(count) + 8, "alloc edge keys");
+    grow(b.keys_alt, b.keys_alt_cap, 8 * static_cast<std::size_t>(count) + 8, "alloc edge keys");
+    std::size_t sort_bytes = 0;
+    check(cub::DeviceRadixSort::SortKeys(nullptr, sort_bytes, b.keys, b.keys_alt, count, 0,
+                                         32 + index_bits, s), "edge sort size");
+    grow(b.scratch, b.scratch_cap, sort_bytes, "alloc scratch");
+    std::int64_t* out = allocate(count);
+    if (count > 0) {
+      const int edge_blocks = std::max(1, std::min(4096, (count + threads - 1) / threads));
+      packEdgesKernel<<<edge_blocks, threads, 0, s>>>(sources, targets, count, b.keys);
+      std::size_t bytes = b.scratch_cap;
+      check(cub::DeviceRadixSort::SortKeys(b.scratch, bytes, b.keys, b.keys_alt, count, 0,
+                                           32 + index_bits, s), "edge sort");
+      unpackEdgesKernel<<<edge_blocks, threads, 0, s>>>(b.keys_alt, count, out);
+      check(cudaGetLastError(), "launch edge output");
+    }
+    // The buffers are shared with the next call, which may use another stream.
+    check(cudaStreamSynchronize(s), "synchronize edge output");
+    *result_count = count;
+    return true;
+  }
+  return false;
+}
+
 }  // namespace
 
 bool buildEdgesFast(const float* points, std::int64_t size, int dimension, float radius,
@@ -596,6 +709,36 @@ bool buildEdgesFast(const float* points, std::int64_t size, int dimension, float
 #define FRNN_FAST_CASE(D) \
   case D:                 \
     return run<D>(points, n, radius, max_neighbors, exclude_self, undirected, result, result_count);
+    FRNN_FAST_CASE(2)
+    FRNN_FAST_CASE(3)
+    FRNN_FAST_CASE(4)
+    FRNN_FAST_CASE(6)
+    FRNN_FAST_CASE(8)
+    FRNN_FAST_CASE(12)
+    FRNN_FAST_CASE(16)
+#undef FRNN_FAST_CASE
+    default:
+      return false;
+  }
+}
+
+bool buildEdgesFastDevice(const float* points, std::int64_t size, int dimension, float radius,
+                          int max_neighbors, bool exclude_self, bool undirected,
+                          cudaStream_t stream,
+                          const std::function<std::int64_t*(std::int64_t)>& allocate,
+                          std::int64_t* result_count) {
+  *result_count = 0;
+  if (points == nullptr || size < 64 || size > (1 << 30) || max_neighbors <= 0 ||
+      !std::isfinite(radius) || radius <= 0.0F) {
+    return false;
+  }
+  std::lock_guard<std::mutex> lock(fastMutex());
+  const int n = static_cast<int>(size);
+  switch (dimension) {
+#define FRNN_FAST_CASE(D) \
+  case D:                 \
+    return runDevice<D>(points, n, radius, max_neighbors, exclude_self, undirected, stream, \
+                        allocate, result_count);
     FRNN_FAST_CASE(2)
     FRNN_FAST_CASE(3)
     FRNN_FAST_CASE(4)

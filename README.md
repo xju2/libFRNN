@@ -299,10 +299,23 @@ operation uses PyTorch's current CUDA stream; because the output length is
 data-dependent, it synchronizes that stream to read the 8-byte edge count and
 again before releasing its temporary workspace. Device inputs must contain
 finite coordinates, matching the C++ device API contract. Edge indices are
-discrete and no autograd operation is registered. The `[2, num_edges]` result
-is a zero-copy transpose of row-major core storage and is therefore not
-contiguous; call `edges.contiguous()` only when a downstream operation requires
-it.
+discrete and no autograd operation is registered.
+
+When `database` is omitted, the call first tries the exact kd-leaf fast path
+(`frnn::buildEdgesFastDevice`), the device-resident form of the NumPy fast
+path: points are read in place, edges never leave the GPU, and the result is a
+contiguous `[2, num_edges]` tensor sorted by `(source, target)`, so repeated
+calls return identical tensors. The fast path declines, and the general path
+below runs, for fewer than 64 points, a dimension other than 2, 3, 4, 6, 8, 12
+or 16, non-finite coordinates, or any point with more than `max_neighbors`
+in-radius neighbors (truncation needs the general path's ordered selection).
+Either way the edge set is the same. On a real 271,663-point, 12-dimensional
+tracking embedding (radius 0.12, 9.28 million edges, A100), the fast path takes
+23.6 ms against 89 ms for the general path.
+
+The general path's `[2, num_edges]` result is a zero-copy transpose of
+row-major core storage and is therefore not contiguous; call
+`edges.contiguous()` only when a downstream operation requires it.
 
 Run the optional binding tests against the installed package with:
 

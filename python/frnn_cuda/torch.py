@@ -11,8 +11,10 @@ except ModuleNotFoundError as error:
     if error.name != f"{__package__}._frnn_torch":
         raise
     raise ImportError(
-        "frnn_cuda was built without PyTorch support; reinstall with "
-        "FRNN_BUILD_TORCH=ON"
+        "frnn_cuda was built without PyTorch support (the PyPI wheels never "
+        "include it). Build it from source in this environment: "
+        "pip install --force-reinstall --no-cache-dir --no-deps "
+        "--no-binary frnn_cuda --no-build-isolation frnn_cuda"
     ) from error
 
 

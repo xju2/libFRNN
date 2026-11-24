@@ -192,17 +192,27 @@ count-first, allocates exact edge storage, and copies the output to the host.
 
 ## Python installation and use
 
-The optional package requires Python 3.9+, NumPy, pybind11, and
-scikit-build-core at build time. It does not require or import PyTorch.
-The `frnn_cuda` name intentionally allows it to coexist with the original
-PyTorch package named `frnn`.
+The package requires Python 3.9+ and NumPy. It does not require or import
+PyTorch. The `frnn_cuda` name intentionally allows it to coexist with the
+original PyTorch package named `frnn`.
 
-The build machine must provide an NVIDIA CUDA Toolkit with `nvcc` and CUDA
-headers/libraries compatible with its compiler and installed NVIDIA driver.
-Failure to locate CUDA is reported by CMake's required CUDA language/toolkit
-checks.
+Install the prebuilt wheel (Linux x86_64, CPython 3.9-3.14) from PyPI:
 
-Build and install with a standard command:
+```bash
+python -m pip install frnn_cuda
+```
+
+The wheels need only an NVIDIA driver supporting CUDA 12.8; the CUDA runtime
+is bundled. They contain code for compute capabilities 7.0 through 12.0 (Volta
+to Blackwell) and PTX for newer GPUs. They provide the NumPy API; the optional
+PyTorch API must be built against your PyTorch and is therefore never in a
+wheel (see [Optional PyTorch CUDA interface](#optional-pytorch-cuda-interface)).
+
+To build from source, the build machine must provide an NVIDIA CUDA Toolkit
+with `nvcc` and CUDA headers/libraries compatible with its compiler and
+installed NVIDIA driver, plus pybind11 and scikit-build-core. Failure to locate
+CUDA is reported by CMake's required CUDA language/toolkit checks. Build and
+install with a standard command:
 
 ```bash
 python -m pip install .
@@ -266,16 +276,30 @@ provided by the base NumPy binding.
 
 ### Optional PyTorch CUDA interface
 
-PyTorch support is a separate build option. The standalone library and default
-Python package still neither require nor import PyTorch. Install PyTorch and the
-normal build requirements into the active environment, then build without pip
-isolation so CMake can find that installation:
+The standalone library and the Python package neither require nor import
+PyTorch. The PyTorch extension is built automatically whenever the Python
+running the build can import a CUDA build of `torch` (`FRNN_BUILD_TORCH=AUTO`,
+the default); CPU-only and ROCm builds of PyTorch are skipped. Because the
+extension must match the installed PyTorch, it is not part of the PyPI wheels:
+build from source in the environment that has PyTorch, without pip isolation so
+CMake sees that installation:
 
 ```bash
-python -m pip install torch scikit-build-core pybind11 numpy
-CMAKE_ARGS="-DFRNN_BUILD_TORCH=ON" \
-  python -m pip install --no-build-isolation .
+python -m pip install scikit-build-core pybind11 numpy   # plus torch, if not installed
+# --force-reinstall --no-cache-dir rebuild even if a wheel is already installed or
+# cached; --no-deps leaves the environment's other packages as they are.
+python -m pip install --force-reinstall --no-cache-dir --no-deps \
+  --no-binary frnn_cuda --no-build-isolation frnn_cuda
+# or, from a checkout or a release tag:
+python -m pip install --no-build-isolation .
+python -m pip install --no-build-isolation "git+https://github.com/xju2/libFRNN.git@v3.1.0"
 ```
+
+The CMake log says `libFRNN: CUDA PyTorch found, building frnn_cuda.torch`, or
+why it skipped the extension. Pass `-DFRNN_BUILD_TORCH=ON` (in `CMAKE_ARGS`) to
+make a missing or CPU-only PyTorch an error instead, or `-DFRNN_BUILD_TORCH=OFF`
+to never build the extension. With pip's default build isolation, PyTorch is
+usually hidden from the build and the extension is skipped.
 
 `Torch_DIR` or `CMAKE_PREFIX_PATH` may be supplied explicitly when using a
 standalone LibTorch installation. With pip-installed PyTorch, CMake obtains the

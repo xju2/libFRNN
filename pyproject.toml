@@ -66,3 +66,20 @@ FRNN_BUILD_PYTHON = "ON"
 FRNN_BUILD_TESTS = "OFF"
 FRNN_BUILD_BENCHMARKS = "OFF"
 BUILD_SHARED_LIBS = "OFF"
+
+# Wheels (CI: .github/workflows/wheels.yml). The CUDA compiler is installed into
+# the manylinux container; auditwheel bundles libcudart, and the NVIDIA driver
+# comes from the user's system. The PyTorch extension is not in the wheels: it
+# must match the user's torch, so it is built from source (FRNN_BUILD_TORCH=AUTO).
+[tool.cibuildwheel]
+build = "cp39-* cp310-* cp311-* cp312-* cp313-* cp314-*"
+skip = "*-musllinux_*"
+archs = ["x86_64"]
+manylinux-x86_64-image = "manylinux_2_28"
+build-verbosity = 1
+test-command = "python -c \"import frnn_cuda; print(frnn_cuda.__version__)\""
+
+[tool.cibuildwheel.linux]
+before-all = "bash {project}/ci/install_cuda.sh"
+# Real code for Volta through Blackwell, plus PTX for newer GPUs.
+environment = { PATH = "/usr/local/cuda/bin:$PATH", CUDACXX = "/usr/local/cuda/bin/nvcc", CMAKE_ARGS = "-DCMAKE_CUDA_ARCHITECTURES='70-real;75-real;80-real;86-real;89-real;90-real;100-real;120'" }

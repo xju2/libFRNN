@@ -1,0 +1,63 @@
+name: build wheels
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+
+jobs:
+  build_wheels:
+    name: Build wheels on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest]
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      # The CUDA toolkit is installed inside the manylinux container
+      # (ci/install_cuda.sh, see [tool.cibuildwheel] in pyproject.toml).
+      - name: Build wheels
+        uses: pypa/cibuildwheel@v3.2.0
+        with:
+          output-dir: dist
+
+      - name: Build sdist
+        run: pip install build && python -m build --sdist
+
+      - name: Check the tag matches the package version
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          version=$(python -c "import tomllib; print(tomllib.load(open('pyproject.toml', 'rb'))['project']['version'])")
+          test "v${version}" = "${GITHUB_REF_NAME}" || {
+            echo "tag ${GITHUB_REF_NAME} does not match version ${version}"; exit 1; }
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cibw-wheels-${{ matrix.os }}-${{ strategy.job-index }}
+          path: dist/*
+
+  publish_pypi:
+    name: Publish to PyPI
+    needs: build_wheels
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: cibw-wheels-*
+          path: dist
+          merge-multiple: true
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          user: __token__
+          password: ${{ secrets.PYPI_API_TOKEN }}

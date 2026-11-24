@@ -13,7 +13,8 @@ except ModuleNotFoundError as error:
     raise ImportError(
         "frnn_cuda was built without PyTorch support (the PyPI wheels never "
         "include it). Build it from source in this environment: "
-        "pip install --no-binary frnn_cuda --no-build-isolation frnn_cuda"
+        "pip install --force-reinstall --no-cache-dir --no-deps "
+        "--no-binary frnn_cuda --no-build-isolation frnn_cuda"
     ) from error
 
 

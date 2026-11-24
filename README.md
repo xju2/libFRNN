@@ -278,24 +278,28 @@ provided by the base NumPy binding.
 
 The standalone library and the Python package neither require nor import
 PyTorch. The PyTorch extension is built automatically whenever the Python
-running the build can import `torch` (`FRNN_BUILD_TORCH=AUTO`, the default).
-Because the extension must match the installed PyTorch, it is not part of the
-PyPI wheels: build from source in the environment that has PyTorch, without pip
-isolation so CMake sees that installation:
+running the build can import a CUDA build of `torch` (`FRNN_BUILD_TORCH=AUTO`,
+the default); CPU-only and ROCm builds of PyTorch are skipped. Because the
+extension must match the installed PyTorch, it is not part of the PyPI wheels:
+build from source in the environment that has PyTorch, without pip isolation so
+CMake sees that installation:
 
 ```bash
 python -m pip install scikit-build-core pybind11 numpy   # plus torch, if not installed
-python -m pip install --no-binary frnn_cuda --no-build-isolation frnn_cuda
+# --force-reinstall --no-cache-dir rebuild even if a wheel is already installed or
+# cached; --no-deps leaves the environment's other packages as they are.
+python -m pip install --force-reinstall --no-cache-dir --no-deps \
+  --no-binary frnn_cuda --no-build-isolation frnn_cuda
 # or, from a checkout or a release tag:
 python -m pip install --no-build-isolation .
 python -m pip install --no-build-isolation "git+https://github.com/xju2/libFRNN.git@v3.1.0"
 ```
 
-The CMake log says `libFRNN: PyTorch found, building frnn_cuda.torch`, or why
-it skipped the extension. Pass `-DFRNN_BUILD_TORCH=ON` (in `CMAKE_ARGS`) to make
-a missing PyTorch an error instead, or `-DFRNN_BUILD_TORCH=OFF` to never build
-the extension. With pip's default build isolation, PyTorch is usually hidden
-from the build and the extension is skipped.
+The CMake log says `libFRNN: CUDA PyTorch found, building frnn_cuda.torch`, or
+why it skipped the extension. Pass `-DFRNN_BUILD_TORCH=ON` (in `CMAKE_ARGS`) to
+make a missing or CPU-only PyTorch an error instead, or `-DFRNN_BUILD_TORCH=OFF`
+to never build the extension. With pip's default build isolation, PyTorch is
+usually hidden from the build and the extension is skipped.
 
 `Torch_DIR` or `CMAKE_PREFIX_PATH` may be supplied explicitly when using a
 standalone LibTorch installation. With pip-installed PyTorch, CMake obtains the

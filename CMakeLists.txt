@@ -157,17 +157,30 @@ if(FRNN_BUILD_PYTHON AND (FRNN_BUILD_TORCH_MODE STREQUAL "AUTO" OR FRNN_BUILD_TO
     endif()
     if(FRNN_BUILD_TORCH_MODE STREQUAL "AUTO")
         find_package(Torch CONFIG QUIET)
-        if(Torch_FOUND)
-            message(STATUS "libFRNN: PyTorch found, building frnn_cuda.torch")
-        else()
-            message(STATUS "libFRNN: PyTorch not importable by ${Python_EXECUTABLE}, "
-                           "skipping frnn_cuda.torch (build with --no-build-isolation "
-                           "in an environment with torch to include it)")
-        endif()
     else()
         find_package(Torch REQUIRED CONFIG)
     endif()
-    set(FRNN_WITH_TORCH ${Torch_FOUND})
+    # The extension uses PyTorch's CUDA API, so it needs a CUDA build of PyTorch.
+    # Only those ship libc10_cuda (CPU-only and ROCm builds do not); checking for
+    # it works for pip-installed PyTorch and standalone LibTorch, without a GPU.
+    if(Torch_FOUND)
+        find_library(FRNN_TORCH_C10_CUDA c10_cuda
+                     PATHS "${TORCH_INSTALL_PREFIX}/lib" NO_DEFAULT_PATH)
+    endif()
+    if(Torch_FOUND AND FRNN_TORCH_C10_CUDA)
+        message(STATUS "libFRNN: CUDA PyTorch found, building frnn_cuda.torch")
+        set(FRNN_WITH_TORCH ON)
+    elseif(NOT FRNN_BUILD_TORCH_MODE STREQUAL "AUTO")
+        message(FATAL_ERROR "FRNN_BUILD_TORCH=ON needs a CUDA build of PyTorch, but "
+                            "${TORCH_INSTALL_PREFIX} has no c10_cuda library")
+    elseif(Torch_FOUND)
+        message(STATUS "libFRNN: PyTorch at ${TORCH_INSTALL_PREFIX} is not a CUDA "
+                       "build, skipping frnn_cuda.torch")
+    else()
+        message(STATUS "libFRNN: PyTorch not importable by ${Python_EXECUTABLE}, "
+                       "skipping frnn_cuda.torch (build with --no-build-isolation "
+                       "in an environment with torch to include it)")
+    endif()
 endif()
 
 if(FRNN_WITH_TORCH)

@@ -112,6 +112,58 @@ class TorchBindingTests(unittest.TestCase):
         self.assertTrue(stream.query())
         self.assert_edges_equal(edges, np.asarray([[1], [0]], dtype=np.int64))
 
+    def test_fast_path_matches_reference(self):
+        # >= 64 points, a supported dimension and no truncation: the kd-leaf
+        # fast path runs and returns edges sorted by (source, target).
+        rng = np.random.default_rng(11)
+        for dimension, radius in ((3, 0.25), (12, 0.9)):
+            points = rng.random((300, dimension), dtype=np.float32)
+            for directed in (True, False):
+                with self.subTest(dimension=dimension, directed=directed):
+                    actual = build_edges(
+                        torch.from_numpy(points).cuda(),
+                        radius=radius,
+                        max_neighbors=300,
+                        directed=directed,
+                    )
+                    expected = reference_edges(
+                        points, radius=radius, max_neighbors=300, directed=directed
+                    )
+                    expected = expected[:, np.lexsort((expected[1], expected[0]))]
+                    self.assertGreater(expected.shape[1], 0)
+                    self.assertTrue(actual.is_contiguous())
+                    self.assert_edges_equal(actual, expected)
+                    again = build_edges(
+                        torch.from_numpy(points).cuda(),
+                        radius=radius,
+                        max_neighbors=300,
+                        directed=directed,
+                    )
+                    self.assertTrue(torch.equal(actual, again))
+
+    def test_fast_path_on_current_stream(self):
+        points = np.random.default_rng(5).random((200, 3), dtype=np.float32)
+        stream = torch.cuda.Stream()
+        with torch.cuda.stream(stream):
+            device_points = torch.from_numpy(points).cuda()
+            edges = build_edges(device_points, radius=0.3, max_neighbors=200)
+        self.assertTrue(stream.query())
+        expected = reference_edges(points, radius=0.3, max_neighbors=200)
+        expected = expected[:, np.lexsort((expected[1], expected[0]))]
+        self.assert_edges_equal(edges, expected)
+
+    def test_truncation_falls_back_to_general_path(self):
+        # More in-radius neighbors than max_neighbors: the fast path declines
+        # and the general path selects the nearest max_neighbors exactly.
+        points = np.random.default_rng(3).random((200, 3), dtype=np.float32)
+        actual = build_edges(
+            torch.from_numpy(points).cuda(), radius=0.5, max_neighbors=4
+        )
+        expected = reference_edges(points, radius=0.5, max_neighbors=4)
+        self.assertEqual(
+            set(map(tuple, actual.cpu().numpy().T)), set(map(tuple, expected.T))
+        )
+
     def test_validation(self):
         valid = torch.zeros((2, 3), dtype=torch.float32, device="cuda")
         invalid = [

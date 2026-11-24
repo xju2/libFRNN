@@ -1,5 +1,7 @@
 #pragma once
 
+#include <cuda_runtime_api.h>
+
 #include <cstdint>
 #include <functional>
 
@@ -25,5 +27,18 @@ bool buildEdgesFast(const float* points, std::int64_t size, int dimension,
                     float radius, int max_neighbors, bool exclude_self,
                     bool undirected, std::int64_t** edges,
                     std::int64_t* edge_count);
+
+// Device-resident variant of buildEdgesFast: points is a device pointer to
+// size * dimension floats, and all work is enqueued on stream.  When the fast
+// path applies, it calls allocate(edge_count) once to obtain a device buffer
+// of 2 * edge_count int64 values, fills it as [sources..., targets...] sorted
+// by (source, target) -- so the output is deterministic -- synchronizes
+// stream, and returns true.  It returns false, without calling allocate, in
+// the same cases as buildEdgesFast; callers must then use buildEdgesAsync().
+bool buildEdgesFastDevice(
+    const float* points, std::int64_t size, int dimension, float radius,
+    int max_neighbors, bool exclude_self, bool undirected, cudaStream_t stream,
+    const std::function<std::int64_t*(std::int64_t)>& allocate,
+    std::int64_t* edge_count);
 
 }  // namespace frnn

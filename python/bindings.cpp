@@ -125,7 +125,7 @@ py::array_t<std::int64_t> buildEdges(
 PYBIND11_MODULE(_frnn, module) {
   module.doc() =
       "NumPy bindings for the standalone libFRNN C++/CUDA library";
-  module.attr("__version__") = "1.0.0";
+  module.attr("__version__") = FRNN_VERSION;
   module.def(
       "build_edges", &buildEdges, py::arg("query"),
       py::arg("database") = py::none(), py::kw_only(), py::arg("radius"),
